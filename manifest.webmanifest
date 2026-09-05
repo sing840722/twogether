@@ -1,0 +1,10 @@
+{
+  "name": "Twogether — Private Couple Questions",
+  "short_name": "Twogether",
+  "description": "Answer privately. Reveal together.",
+  "start_url": "./",
+  "display": "standalone",
+  "background_color": "#fffaf7",
+  "theme_color": "#fffaf7",
+  "icons": [{ "src": "icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any maskable" }]
+}

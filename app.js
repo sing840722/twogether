@@ -1,4 +1,32 @@
-const QUESTIONS = [
+import { initializeApp } from "https://www.gstatic.com/firebasejs/12.18.0/firebase-app.js";
+import {
+  getAuth,
+  GoogleAuthProvider,
+  onAuthStateChanged,
+  setPersistence,
+  browserLocalPersistence,
+  signInWithPopup,
+  signOut
+} from "https://www.gstatic.com/firebasejs/12.18.0/firebase-auth.js";
+import {
+  getFirestore,
+  collection,
+  doc,
+  getDoc,
+  setDoc,
+  updateDoc,
+  deleteDoc,
+  writeBatch,
+  runTransaction,
+  onSnapshot,
+  query,
+  orderBy,
+  deleteField,
+  serverTimestamp
+} from "https://www.gstatic.com/firebasejs/12.18.0/firebase-firestore.js";
+import { firebaseConfig } from "./firebase-config.js";
+
+const BUILTIN_QUESTIONS = [
   "What made you smile most this week?",
   "What is one small thing I do that you love?",
   "Where should our next little adventure be?",
@@ -11,57 +39,24 @@ const QUESTIONS = [
   "What is one thing you have wanted to tell me lately?"
 ];
 
-const HOST_PROFILE_KEY = "twogether.host.v2";
-const enc = new TextEncoder();
-const dec = new TextDecoder();
+const firebaseApp = initializeApp(firebaseConfig);
+const auth = getAuth(firebaseApp);
+const db = getFirestore(firebaseApp);
+const provider = new GoogleAuthProvider();
 const app = document.querySelector("#app");
 
-let profile = null;
-let own = { answers: {}, revealed: {} };
-let partner = { name: "Partner", answered: {}, revealed: {} };
-let customQuestions = [];
-let peer = null;
-let connection = null;
-let localChannel = null;
-let localLive = false;
-let connectionState = "offline";
+let currentUser = null;
+let userProfile = null;
+let coupleId = null;
+let couple = null;
+let questions = [];
+let ownAnswers = {};
 let currentTab = "answer";
-let reconnectTimer = null;
-let joinPayload = readJoinPayload();
-
-function readJSON(key) {
-  try { return JSON.parse(localStorage.getItem(key)); } catch { return null; }
-}
-
-function writeJSON(key, value) { localStorage.setItem(key, JSON.stringify(value)); }
-
-function randomToken(bytes = 12) {
-  return bytesToB64(crypto.getRandomValues(new Uint8Array(bytes)));
-}
-
-function bytesToB64(bytes) {
-  let binary = "";
-  bytes.forEach((byte) => binary += String.fromCharCode(byte));
-  return btoa(binary).replaceAll("+", "-").replaceAll("/", "_").replaceAll("=", "");
-}
-
-function b64ToBytes(value) {
-  const normalized = value.replaceAll("-", "+").replaceAll("_", "/");
-  const binary = atob(normalized + "=".repeat((4 - normalized.length % 4) % 4));
-  return Uint8Array.from(binary, (char) => char.charCodeAt(0));
-}
-
-function encodePayload(value) { return bytesToB64(enc.encode(JSON.stringify(value))); }
-function decodePayload(value) { return JSON.parse(dec.decode(b64ToBytes(value))); }
-
-function readJoinPayload() {
-  try {
-    const value = new URLSearchParams(location.hash.slice(1)).get("join");
-    if (!value) return null;
-    const payload = decodePayload(value);
-    return payload.v === 2 && payload.roomId && payload.secret && payload.hostId ? payload : null;
-  } catch { return null; }
-}
+let syncState = "connecting";
+let roomUnsubs = [];
+let answerUnsubs = new Map();
+let publishing = new Set();
+const joinId = new URLSearchParams(location.hash.slice(1)).get("join");
 
 function escapeHTML(value = "") {
   return String(value).replace(/[&<>'"]/g, (char) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", "'": "&#39;", '"': "&quot;" })[char]);
@@ -72,251 +67,227 @@ function toast(message) {
   element.textContent = message;
   element.classList.add("show");
   clearTimeout(toast.timer);
-  toast.timer = setTimeout(() => element.classList.remove("show"), 2400);
+  toast.timer = setTimeout(() => element.classList.remove("show"), 2800);
 }
 
-function dataKey() { return `twogether.person.v2.${profile.roomId}.${profile.role}.${profile.participantId}`; }
-
-function allQuestions() {
-  return [
-    ...QUESTIONS.map((text, index) => ({ id: String(index), text, author: null })),
-    ...customQuestions
-  ];
+function randomToken(bytes = 12) {
+  const values = crypto.getRandomValues(new Uint8Array(bytes));
+  let binary = "";
+  values.forEach((value) => binary += String.fromCharCode(value));
+  return btoa(binary).replaceAll("+", "-").replaceAll("/", "_").replaceAll("=", "");
 }
 
-function mergeCustomQuestions(incoming = []) {
-  const byId = new Map(customQuestions.map((question) => [question.id, question]));
-  incoming.forEach((question) => {
-    if (!question || !/^c_[A-Za-z0-9_-]+$/.test(question.id) || typeof question.text !== "string") return;
-    byId.set(question.id, { id: question.id, text: question.text.trim().slice(0, 180), author: String(question.author || "Partner").slice(0, 24) });
-  });
-  customQuestions = [...byId.values()].filter((question) => question.text);
+async function roomIdFrom(code) {
+  const bytes = new TextEncoder().encode(`${currentUser.uid}:${code.trim().toLowerCase()}`);
+  const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", bytes));
+  let binary = "";
+  digest.forEach((value) => binary += String.fromCharCode(value));
+  return btoa(binary).replaceAll("+", "-").replaceAll("/", "_").replaceAll("=", "").slice(0, 22);
 }
 
-function saveOwn() {
-  writeJSON(dataKey(), { name: profile.name, answers: own.answers, revealed: own.revealed, customQuestions });
-  if (profile.role === "host") writeJSON(HOST_PROFILE_KEY, profile);
-  else writeJSON(`twogether.guest.v2.${profile.roomId}`, profile);
+function cleanupRoom() {
+  roomUnsubs.forEach((unsubscribe) => unsubscribe());
+  roomUnsubs = [];
+  answerUnsubs.forEach((unsubscribe) => unsubscribe());
+  answerUnsubs.clear();
+  questions = [];
+  ownAnswers = {};
+  couple = null;
 }
 
-function loadOwn() {
-  const saved = readJSON(dataKey());
-  own = saved ? { answers: saved.answers || {}, revealed: saved.revealed || {} } : { answers: {}, revealed: {} };
-  customQuestions = saved?.customQuestions || [];
+function renderLoading(message = "Opening your space…") {
+  app.innerHTML = `<main class="welcome"><div class="brand"><span class="brand-mark">♥</span> Twogether</div><div class="sync-card" style="margin-top:35vh"><div class="sync-icon">⏳</div><h2>${escapeHTML(message)}</h2></div></main>`;
 }
 
-function answeredMap() {
-  return Object.fromEntries(allQuestions().map((question) => [question.id, Boolean(own.answers[question.id])]));
-}
-
-function shareLink() {
-  const payload = encodePayload({ v: 2, roomId: profile.roomId, secret: profile.secret, hostId: profile.hostId, hostName: profile.name });
-  return `${location.origin}${location.pathname}#join=${payload}`;
-}
-
-function landing() {
-  const previous = readJSON(HOST_PROFILE_KEY);
-  app.innerHTML = `
-    <main class="welcome">
-      <div class="brand"><span class="brand-mark">♥</span> Twogether</div>
-      <div class="heart-pair"><div class="heart one">💌</div><div class="heart two">⚡</div></div>
-      <p class="eyebrow">Private answers · live reveal</p>
-      <h1>Just the two of you.</h1>
-      <p class="welcome-copy">Create a private room, send one link, and answer together in real time.</p>
-      ${previous ? `<button id="continue-room" class="button secondary" style="margin-bottom:12px">Continue as ${escapeHTML(previous.name)}</button>` : ""}
-      <form id="create-form" class="card stack">
-        <div class="field"><label for="name">Your name</label><input id="name" required maxlength="24" placeholder="Your name" autocomplete="nickname"></div>
-        <div class="field"><label for="share-code">Private share code</label><input id="share-code" required minlength="6" maxlength="40" placeholder="Something only you would choose" autocomplete="off"></div>
-        <button class="button primary" type="submit">Generate our link</button>
-        <div class="privacy-note"><span>🔒</span><span>The code creates a unique room link. Unrevealed answer text stays on your own device.</span></div>
-      </form>
-    </main>`;
-  document.querySelector("#continue-room")?.addEventListener("click", () => resumeHost(previous));
-  document.querySelector("#create-form").addEventListener("submit", async (event) => {
-    event.preventDefault();
-    const name = document.querySelector("#name").value.trim();
-    const code = document.querySelector("#share-code").value;
-    const salt = randomToken(12);
-    const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", enc.encode(`${code}:${salt}`)));
-    const roomId = bytesToB64(digest).slice(0, 14);
-    profile = { role: "host", name, roomId, secret: bytesToB64(digest), hostId: `twogether-${roomId}`, participantId: randomToken(9) };
-    own = { answers: {}, revealed: {} };
-    customQuestions = [];
-    saveOwn();
-    renderApp();
-    startPeer();
+function renderLogin() {
+  app.innerHTML = `<main class="welcome">
+    <div class="brand"><span class="brand-mark">♥</span> Twogether</div>
+    <div class="heart-pair"><div class="heart one">💌</div><div class="heart two">☁️</div></div>
+    <p class="eyebrow">Private answers · saved together</p>
+    <h1>Your questions, always here.</h1>
+    <p class="welcome-copy">Sign in once, invite your person, and answer whenever you feel like it.</p>
+    <section class="card stack"><button id="google-login" class="button primary"><span style="margin-right:8px">G</span> Continue with Google</button><div class="privacy-note"><span>🔒</span><span>Private answers can only be read by the person who wrote them until reveal.</span></div></section>
+  </main>`;
+  document.querySelector("#google-login").addEventListener("click", async () => {
+    try {
+      await setPersistence(auth, browserLocalPersistence);
+      await signInWithPopup(auth, provider);
+    } catch (error) {
+      toast(error.code === "auth/unauthorized-domain" ? "Add this website to Firebase Authorized domains" : "Google sign-in did not finish");
+    }
   });
 }
 
-function resumeHost(previous) {
-  profile = previous;
-  loadOwn();
-  renderApp();
-  startPeer();
-}
-
-function joinScreen(payload) {
-  const previous = readJSON(`twogether.guest.v2.${payload.roomId}`);
-  app.innerHTML = `
-    <main class="welcome">
-      <div class="brand"><span class="brand-mark">♥</span> Twogether</div>
-      <div class="heart-pair"><div class="heart one">👋</div><div class="heart two">💞</div></div>
-      <p class="eyebrow">You're invited</p>
-      <h1>Join ${escapeHTML(payload.hostName || "your partner")}.</h1>
-      <p class="welcome-copy">Put your name down and your shared question room will open.</p>
-      <form id="join-form" class="card stack">
-        <div class="field"><label for="name">Your name</label><input id="name" required maxlength="24" value="${escapeHTML(previous?.name || "")}" placeholder="Your name" autocomplete="nickname"></div>
-        <button class="button primary" type="submit">Start answering</button>
-        <div class="privacy-note"><span>⚡</span><span>Live answers work while both of you have the app open and are online.</span></div>
-      </form>
-    </main>`;
-  document.querySelector("#join-form").addEventListener("submit", (event) => {
-    event.preventDefault();
-    const name = document.querySelector("#name").value.trim();
-    profile = { role: "guest", name, roomId: payload.roomId, secret: payload.secret, hostId: payload.hostId, hostName: payload.hostName, participantId: previous?.participantId || randomToken(9) };
-    loadOwn();
-    saveOwn();
-    partner.name = payload.hostName || "Partner";
-    renderApp();
-    startPeer();
-  });
-}
-
-function startPeer() {
-  if (!window.Peer) {
-    connectionState = "error";
-    renderApp();
-    return toast("Live connection library could not load");
+async function loadAccount() {
+  renderLoading();
+  try {
+    const snapshot = await getDoc(doc(db, "users", currentUser.uid));
+    userProfile = snapshot.exists() ? snapshot.data() : null;
+    if (joinId && userProfile?.coupleId !== joinId) return renderJoin();
+    if (userProfile?.coupleId) return subscribeRoom(userProfile.coupleId);
+    renderCreate();
+  } catch (error) {
+    renderSetupError(error);
   }
-  clearTimeout(reconnectTimer);
-  peer?.destroy();
-  localChannel?.close();
-  connection = null;
-  localLive = false;
-  connectionState = "connecting";
-  renderApp();
-  localChannel = new BroadcastChannel(`twogether-live-${profile.roomId}`);
-  localChannel.onmessage = (event) => {
-    const message = event.data;
-    if (!message || message.senderId === profile.participantId) return;
-    localLive = true;
-    connectionState = "live";
-    receive(message);
-    if (message.type === "hello" && message.requestReply) sendHello(false);
-  };
-  sendHello(true);
-  peer = profile.role === "host" ? new Peer(profile.hostId, { debug: 1 }) : new Peer({ debug: 1 });
-  peer.on("open", () => {
-    connectionState = "waiting";
+}
+
+function defaultName() {
+  return userProfile?.displayName || currentUser?.displayName || "";
+}
+
+function accountChip() {
+  const photo = currentUser?.photoURL ? `<img src="${escapeHTML(currentUser.photoURL)}" alt="">` : "";
+  return `<span class="account-chip">${photo}${escapeHTML(defaultName() || currentUser?.email || "Signed in")}</span>`;
+}
+
+function renderCreate() {
+  app.innerHTML = `<main class="welcome">
+    <div class="topbar"><div class="brand"><span class="brand-mark">♥</span> Twogether</div>${accountChip()}</div>
+    <p class="eyebrow">Create your shared space</p><h1>Start with one link.</h1>
+    <p class="welcome-copy">Choose how your name appears and make a private code to generate the invitation.</p>
+    <form id="create-room" class="card stack">
+      <div class="field"><label for="name">Your name</label><input id="name" required maxlength="24" value="${escapeHTML(defaultName())}" placeholder="Your name"></div>
+      <div class="field"><label for="share-code">Private share code</label><input id="share-code" required minlength="6" maxlength="40" placeholder="Something memorable"></div>
+      <button class="button primary" type="submit">Create our space</button>
+      <button class="button ghost" id="sign-out" type="button">Use another Google account</button>
+    </form>
+  </main>`;
+  document.querySelector("#sign-out").addEventListener("click", () => signOut(auth));
+  document.querySelector("#create-room").addEventListener("submit", createRoom);
+}
+
+async function createRoom(event) {
+  event.preventDefault();
+  const button = event.submitter;
+  button.disabled = true;
+  button.textContent = "Creating…";
+  const name = document.querySelector("#name").value.trim();
+  const roomId = await roomIdFrom(document.querySelector("#share-code").value);
+  try {
+    const coupleRef = doc(db, "couples", roomId);
+    const existing = await getDoc(coupleRef);
+    if (!existing.exists()) {
+      await setDoc(coupleRef, { memberIds: [currentUser.uid], names: { [currentUser.uid]: name }, createdBy: currentUser.uid, createdAt: serverTimestamp(), updatedAt: serverTimestamp() });
+      const batch = writeBatch(db);
+      BUILTIN_QUESTIONS.forEach((text, index) => {
+        batch.set(doc(db, "couples", roomId, "questions", `builtin-${index + 1}`), {
+          text, order: index, builtIn: true, createdBy: currentUser.uid, authorName: name,
+          ready: {}, revealRequested: false, revealedAnswers: {}, createdAt: serverTimestamp()
+        });
+      });
+      await batch.commit();
+    }
+    await setDoc(doc(db, "users", currentUser.uid), { displayName: name, email: currentUser.email || "", photoURL: currentUser.photoURL || "", coupleId: roomId, updatedAt: serverTimestamp() }, { merge: true });
+    userProfile = { displayName: name, coupleId: roomId };
+    subscribeRoom(roomId);
+  } catch (error) {
+    button.disabled = false;
+    button.textContent = "Create our space";
+    toast(friendlyError(error));
+  }
+}
+
+function renderJoin() {
+  app.innerHTML = `<main class="welcome">
+    <div class="topbar"><div class="brand"><span class="brand-mark">♥</span> Twogether</div>${accountChip()}</div>
+    <div class="heart-pair"><div class="heart one">👋</div><div class="heart two">💞</div></div>
+    <p class="eyebrow">You're invited</p><h1>Join your person.</h1>
+    <p class="welcome-copy">Choose the name they will see beside your answers.</p>
+    <form id="join-room" class="card stack"><div class="field"><label for="name">Your name</label><input id="name" required maxlength="24" value="${escapeHTML(defaultName())}" placeholder="Your name"></div><button class="button primary" type="submit">Join and start answering</button><button class="button ghost" id="sign-out" type="button">Use another Google account</button></form>
+  </main>`;
+  document.querySelector("#sign-out").addEventListener("click", () => signOut(auth));
+  document.querySelector("#join-room").addEventListener("submit", joinRoom);
+}
+
+async function joinRoom(event) {
+  event.preventDefault();
+  const button = event.submitter;
+  button.disabled = true;
+  button.textContent = "Joining…";
+  const name = document.querySelector("#name").value.trim();
+  try {
+    await runTransaction(db, async (transaction) => {
+      const coupleRef = doc(db, "couples", joinId);
+      const snapshot = await transaction.get(coupleRef);
+      if (!snapshot.exists()) throw new Error("invite-not-found");
+      const data = snapshot.data();
+      const members = data.memberIds || [];
+      if (!members.includes(currentUser.uid) && members.length >= 2) throw new Error("room-full");
+      if (!members.includes(currentUser.uid)) {
+        transaction.update(coupleRef, { memberIds: [...members, currentUser.uid], [`names.${currentUser.uid}`]: name, updatedAt: serverTimestamp() });
+      }
+      transaction.set(doc(db, "users", currentUser.uid), { displayName: name, email: currentUser.email || "", photoURL: currentUser.photoURL || "", coupleId: joinId, updatedAt: serverTimestamp() }, { merge: true });
+    });
+    userProfile = { displayName: name, coupleId: joinId };
+    subscribeRoom(joinId);
+  } catch (error) {
+    button.disabled = false;
+    button.textContent = "Join and start answering";
+    toast(friendlyError(error));
+  }
+}
+
+function subscribeRoom(id) {
+  cleanupRoom();
+  coupleId = id;
+  syncState = "connecting";
+  renderLoading("Syncing your questions…");
+  roomUnsubs.push(onSnapshot(doc(db, "couples", id), (snapshot) => {
+    if (!snapshot.exists()) return renderSetupError(new Error("Room not found"));
+    couple = snapshot.data();
+    syncState = snapshot.metadata.fromCache ? "offline" : "live";
     renderApp();
-    if (profile.role === "guest") connectToHost();
-  });
-  peer.on("connection", (incoming) => {
-    if (profile.role !== "host" || incoming.metadata?.roomId !== profile.roomId || incoming.metadata?.secret !== profile.secret) return incoming.close();
-    setupConnection(incoming);
-  });
-  peer.on("disconnected", () => {
-    connectionState = localLive ? "live" : "offline";
+  }, (error) => renderSetupError(error)));
+  const questionsQuery = query(collection(db, "couples", id, "questions"), orderBy("order"));
+  roomUnsubs.push(onSnapshot(questionsQuery, (snapshot) => {
+    questions = snapshot.docs.map((item) => ({ id: item.id, ...item.data() }));
+    syncState = snapshot.metadata.fromCache ? "offline" : "live";
+    syncAnswerListeners();
+    questions.forEach(maybePublishReveal);
     renderApp();
-    try { peer.reconnect(); } catch { /* handled by normal retry */ }
+  }, (error) => renderSetupError(error)));
+}
+
+function syncAnswerListeners() {
+  const active = new Set(questions.map((question) => question.id));
+  answerUnsubs.forEach((unsubscribe, id) => {
+    if (!active.has(id)) { unsubscribe(); answerUnsubs.delete(id); delete ownAnswers[id]; }
   });
-  peer.on("error", (error) => {
-    if (error.type === "peer-unavailable" && profile.role === "guest") {
-      connectionState = localLive ? "live" : "waiting";
+  questions.forEach((question) => {
+    if (answerUnsubs.has(question.id)) return;
+    const answerRef = doc(db, "couples", coupleId, "questions", question.id, "privateAnswers", currentUser.uid);
+    const unsubscribe = onSnapshot(answerRef, (snapshot) => {
+      if (snapshot.exists()) ownAnswers[question.id] = snapshot.data().text || "";
+      else delete ownAnswers[question.id];
+      const freshQuestion = questions.find((item) => item.id === question.id);
+      if (freshQuestion) maybePublishReveal(freshQuestion);
       renderApp();
-      scheduleReconnect();
-      return;
+    });
+    answerUnsubs.set(question.id, unsubscribe);
+  });
+}
+
+async function maybePublishReveal(question) {
+  if (!question.revealRequested || !question.ready?.[currentUser.uid] || question.revealedAnswers?.[currentUser.uid] || publishing.has(question.id)) return;
+  publishing.add(question.id);
+  try {
+    const answerRef = doc(db, "couples", coupleId, "questions", question.id, "privateAnswers", currentUser.uid);
+    const snapshot = await getDoc(answerRef);
+    if (snapshot.exists() && snapshot.data().text) {
+      await updateDoc(doc(db, "couples", coupleId, "questions", question.id), { [`revealedAnswers.${currentUser.uid}`]: snapshot.data().text, updatedAt: serverTimestamp() });
     }
-    connectionState = localLive ? "live" : "error";
-    renderApp();
-    toast(error.type === "unavailable-id" ? "This room is already open in another tab" : "Live connection interrupted");
-  });
+  } catch (error) { toast(friendlyError(error)); }
+  finally { publishing.delete(question.id); }
 }
 
-function connectToHost() {
-  if (!peer || peer.destroyed || connection?.open) return;
-  setupConnection(peer.connect(profile.hostId, { reliable: true, metadata: { roomId: profile.roomId, secret: profile.secret, name: profile.name, participantId: profile.participantId } }));
-}
-
-function scheduleReconnect() {
-  clearTimeout(reconnectTimer);
-  reconnectTimer = setTimeout(connectToHost, 4000);
-}
-
-function setupConnection(nextConnection) {
-  if (connection && connection !== nextConnection) connection.close();
-  connection = nextConnection;
-  connection.on("open", () => {
-    clearTimeout(reconnectTimer);
-    connectionState = "live";
-    sendHello(false);
-    renderApp();
-  });
-  connection.on("data", receive);
-  connection.on("close", () => {
-    if (connection !== nextConnection) return;
-    connection = null;
-    connectionState = localLive ? "live" : "waiting";
-    renderApp();
-    if (profile.role === "guest") scheduleReconnect();
-  });
-  connection.on("error", () => {
-    connectionState = "error";
-    renderApp();
-  });
-}
-
-function send(message) {
-  const wireMessage = { ...message, senderId: profile.participantId };
-  localChannel?.postMessage(wireMessage);
-  if (connection?.open) connection.send(wireMessage);
-}
-
-function sendHello(requestReply) {
-  send({ type: "hello", requestReply, name: profile.name, participantId: profile.participantId, answered: answeredMap(), revealed: own.revealed, customQuestions });
-}
-
-function receive(message) {
-  if (!message || typeof message !== "object") return;
-  if (message.type === "hello") {
-    mergeCustomQuestions(message.customQuestions);
-    partner.name = String(message.name || "Partner").slice(0, 24);
-    partner.answered = message.answered || {};
-    partner.revealed = message.revealed || {};
-    if (profile.role === "host") profile.partnerName = partner.name;
-    saveOwn();
-  }
-  if (message.type === "custom-question") {
-    mergeCustomQuestions([message.question]);
-    saveOwn();
-  }
-  if (message.type === "answer-status") {
-    partner.answered[message.question] = Boolean(message.answered);
-    delete partner.revealed[message.question];
-    delete own.revealed[message.question];
-    saveOwn();
-  }
-  if (message.type === "reveal-request") {
-    partner.revealed[message.question] = String(message.answer || "");
-    if (own.answers[message.question]) {
-      own.revealed[message.question] = own.answers[message.question];
-      saveOwn();
-      send({ type: "revealed", question: message.question, answer: own.answers[message.question] });
-    }
-  }
-  if (message.type === "revealed") partner.revealed[message.question] = String(message.answer || "");
-  renderApp();
-}
+function partnerId() { return couple?.memberIds?.find((id) => id !== currentUser.uid) || null; }
+function myName() { return couple?.names?.[currentUser.uid] || userProfile?.displayName || currentUser.displayName || "You"; }
+function partnerName() { const id = partnerId(); return id ? couple?.names?.[id] || "Partner" : "Your person"; }
 
 function statusMarkup() {
-  const states = {
-    live: ["live", `${escapeHTML(partner.name)} is here`],
-    connecting: ["connecting", "Connecting…"],
-    waiting: ["waiting", profile.role === "host" ? "Waiting for partner" : `Waiting for ${escapeHTML(profile.hostName || "partner")}`],
-    offline: ["offline", "Offline"],
-    error: ["offline", "Connection issue"]
-  };
-  const [className, label] = states[connectionState];
+  const waiting = !partnerId();
+  const label = syncState === "offline" ? "Offline" : waiting ? "Waiting for partner" : "Saved live";
+  const className = syncState === "offline" ? "offline" : waiting ? "waiting" : "live";
   return `<span class="live-pill ${className}"><span class="live-dot"></span>${label}</span>`;
 }
 
@@ -329,20 +300,17 @@ function nav() {
 }
 
 function renderApp() {
-  if (!profile) return joinPayload ? joinScreen(joinPayload) : landing();
+  if (!currentUser) return renderLogin();
+  if (!coupleId || !couple) return;
   if (currentTab === "answer") renderQuestions();
   if (currentTab === "together") renderTogether();
   if (currentTab === "invite") renderInvite();
-  document.querySelectorAll("[data-tab]").forEach((button) => button.addEventListener("click", () => {
-    currentTab = button.dataset.tab;
-    renderApp();
-  }));
+  document.querySelectorAll("[data-tab]").forEach((button) => button.addEventListener("click", () => { currentTab = button.dataset.tab; renderApp(); }));
 }
 
 function renderQuestions() {
-  const questions = allQuestions();
-  const count = Object.values(own.answers).filter(Boolean).length;
-  app.innerHTML = `${header(`Hi, ${profile.name}`, "Your private answers")}<section class="hero-row"><p class="muted" style="margin:0">Saved as you. Your words stay here until reveal.</p><div class="progress-ring" style="--progress:${count / questions.length * 360}deg"><span>${count}/${questions.length}</span></div></section><button id="add-question" class="button secondary add-question">＋ Add your own question</button><div class="question-list">${questions.map((question, index) => `<button class="question ${own.answers[question.id] ? "done" : ""}" data-question="${question.id}"><span class="question-number">${own.answers[question.id] ? "✓" : index + 1}</span><span class="question-title">${escapeHTML(question.text)}${question.author ? `<small>Added by ${escapeHTML(question.author)}</small>` : ""}</span><span class="question-status">›</span></button>`).join("")}</div>${nav()}`;
+  const count = questions.filter((question) => ownAnswers[question.id]).length;
+  app.innerHTML = `${header(`Hi, ${myName()}`, "Your private answers")}<section class="hero-row"><p class="muted" style="margin:0">Saved to your account. Hidden until reveal.</p><div class="progress-ring" style="--progress:${questions.length ? count / questions.length * 360 : 0}deg"><span>${count}/${questions.length}</span></div></section><button id="add-question" class="button secondary add-question">＋ Add your own question</button><div class="question-list">${questions.map((question, index) => `<button class="question ${ownAnswers[question.id] ? "done" : ""}" data-question="${question.id}"><span class="question-number">${ownAnswers[question.id] ? "✓" : index + 1}</span><span class="question-title">${escapeHTML(question.text)}${question.builtIn ? "" : `<small>Added by ${escapeHTML(question.authorName || "Partner")}</small>`}</span><span class="question-status">›</span></button>`).join("")}</div>${nav()}`;
   document.querySelector("#add-question").addEventListener("click", addCustomQuestion);
   document.querySelectorAll("[data-question]").forEach((button) => button.addEventListener("click", () => editAnswer(button.dataset.question)));
 }
@@ -353,121 +321,104 @@ function addCustomQuestion() {
   overlay.innerHTML = `<section class="sheet"><div class="sheet-handle"></div><p class="eyebrow">Ask something personal</p><h2>Add your own question</h2><div class="field" style="margin-top:18px"><label for="custom-question">Question</label><textarea id="custom-question" maxlength="180" placeholder="What would you love to ask each other?"></textarea></div><div class="sheet-actions"><button class="button ghost" id="cancel">Cancel</button><button class="button primary" id="add">Add for both</button></div></section>`;
   document.body.appendChild(overlay);
   const close = () => overlay.remove();
-  overlay.addEventListener("click", (event) => { if (event.target === overlay) close(); });
   document.querySelector("#cancel").addEventListener("click", close);
-  document.querySelector("#add").addEventListener("click", () => {
+  document.querySelector("#add").addEventListener("click", async () => {
     const text = document.querySelector("#custom-question").value.trim();
     if (!text) return toast("Write a question first");
-    const question = { id: `c_${randomToken(9)}`, text, author: profile.name };
-    customQuestions.push(question);
-    saveOwn();
-    send({ type: "custom-question", question });
-    close();
-    renderApp();
-    toast("Question added for both of you");
+    const id = `custom-${randomToken(9)}`;
+    try {
+      await setDoc(doc(db, "couples", coupleId, "questions", id), { text, order: Date.now(), builtIn: false, createdBy: currentUser.uid, authorName: myName(), ready: {}, revealRequested: false, revealedAnswers: {}, createdAt: serverTimestamp() });
+      close(); toast("Question added for both of you");
+    } catch (error) { toast(friendlyError(error)); }
   });
   document.querySelector("#custom-question").focus();
 }
 
 function editAnswer(id) {
-  const question = allQuestions().find((item) => item.id === id);
+  const question = questions.find((item) => item.id === id);
   if (!question) return;
-  const number = allQuestions().findIndex((item) => item.id === id) + 1;
+  const number = questions.findIndex((item) => item.id === id) + 1;
   const overlay = document.createElement("div");
   overlay.className = "sheet-backdrop";
-  overlay.innerHTML = `<section class="sheet"><div class="sheet-handle"></div><p class="eyebrow">${escapeHTML(profile.name)} · Question ${number}</p><h2>${escapeHTML(question.text)}</h2><div class="field" style="margin-top:18px"><label for="answer">Your answer</label><textarea id="answer" maxlength="600" placeholder="Write what feels true…">${escapeHTML(own.answers[id] || "")}</textarea></div><div class="sheet-actions"><button class="button ghost" id="cancel">Cancel</button><button class="button primary" id="save">Save as ${escapeHTML(profile.name)}</button></div></section>`;
+  overlay.innerHTML = `<section class="sheet"><div class="sheet-handle"></div><p class="eyebrow">${escapeHTML(myName())} · Question ${number}</p><h2>${escapeHTML(question.text)}</h2><div class="field" style="margin-top:18px"><label for="answer">Your answer</label><textarea id="answer" maxlength="600" placeholder="Write what feels true…">${escapeHTML(ownAnswers[id] || "")}</textarea></div><div class="sheet-actions"><button class="button ghost" id="cancel">Cancel</button><button class="button primary" id="save">Save privately</button></div></section>`;
   document.body.appendChild(overlay);
   const close = () => overlay.remove();
-  overlay.addEventListener("click", (event) => { if (event.target === overlay) close(); });
   document.querySelector("#cancel").addEventListener("click", close);
-  document.querySelector("#save").addEventListener("click", () => {
+  document.querySelector("#save").addEventListener("click", async () => {
     const value = document.querySelector("#answer").value.trim();
-    if (value) own.answers[id] = value;
-    else delete own.answers[id];
-    delete own.revealed[id];
-    delete partner.revealed[id];
-    saveOwn();
-    send({ type: "answer-status", question: id, answered: Boolean(value) });
-    close();
-    renderApp();
-    toast(`Saved as ${profile.name}`);
+    const answerRef = doc(db, "couples", coupleId, "questions", id, "privateAnswers", currentUser.uid);
+    const questionRef = doc(db, "couples", coupleId, "questions", id);
+    try {
+      if (value) await setDoc(answerRef, { text: value, ownerId: currentUser.uid, updatedAt: serverTimestamp() });
+      else await deleteDoc(answerRef);
+      await updateDoc(questionRef, { [`ready.${currentUser.uid}`]: Boolean(value), [`revealedAnswers.${currentUser.uid}`]: deleteField(), revealRequested: false, updatedAt: serverTimestamp() });
+      close(); toast("Saved privately to your account");
+    } catch (error) { toast(friendlyError(error)); }
   });
   document.querySelector("#answer").focus();
 }
 
 function renderTogether() {
-  const questions = allQuestions();
-  const matching = questions.filter((question) => own.answers[question.id] && partner.answered[question.id]);
-  const partnerName = partner.name || profile.partnerName || profile.hostName || "Partner";
-  app.innerHTML = `${header("Reveal together", "Updates live")}<section class="card sync-card"><div class="sync-icon">${connectionState === "live" ? "✨" : "⏳"}</div><h2>${connectionState === "live" ? `${matching.length} ready` : "Waiting to reconnect"}</h2><p class="muted">When either of you reveals a question, it opens instantly on both screens.</p></section><div class="reveal-grid">${questions.map((question) => {
-    const mineAnswered = Boolean(own.answers[question.id]);
-    const theirsAnswered = Boolean(partner.answered[question.id]);
-    const open = Boolean(own.revealed[question.id] && partner.revealed[question.id]);
-    return `<article class="reveal-card"><p class="reveal-question">${escapeHTML(question.text)}</p><div class="ready-row"><span>${mineAnswered ? "✓" : "○"} ${escapeHTML(profile.name)}</span><span>${theirsAnswered ? "✓" : "○"} ${escapeHTML(partnerName)}</span></div>${open ? `<div class="answers"><div class="answer"><div class="answer-name">${escapeHTML(profile.name)}</div><div class="answer-text">${escapeHTML(own.revealed[question.id])}</div></div><div class="answer partner"><div class="answer-name">${escapeHTML(partnerName)}</div><div class="answer-text">${escapeHTML(partner.revealed[question.id])}</div></div></div>` : `<button class="button ${mineAnswered && theirsAnswered ? "primary" : "ghost"}" data-reveal="${question.id}" ${connectionState === "live" && mineAnswered && theirsAnswered ? "" : "disabled"}>${mineAnswered && theirsAnswered ? "Reveal this answer" : "Waiting for both answers"}</button>`}</article>`;
+  const otherId = partnerId();
+  const matching = questions.filter((question) => otherId && question.ready?.[currentUser.uid] && question.ready?.[otherId]);
+  app.innerHTML = `${header("Reveal together", "Updates automatically")}<section class="card sync-card"><div class="sync-icon">${otherId ? "✨" : "⏳"}</div><h2>${otherId ? `${matching.length} ready` : "Waiting for your person"}</h2><p class="muted">You can answer at different times. When either person reveals, both answers appear here.</p></section><div class="reveal-grid">${questions.map((question) => {
+    const mineReady = Boolean(question.ready?.[currentUser.uid]);
+    const theirsReady = Boolean(otherId && question.ready?.[otherId]);
+    const mine = question.revealedAnswers?.[currentUser.uid];
+    const theirs = otherId ? question.revealedAnswers?.[otherId] : null;
+    const open = Boolean(mine && theirs);
+    return `<article class="reveal-card"><p class="reveal-question">${escapeHTML(question.text)}</p><div class="ready-row"><span>${mineReady ? "✓" : "○"} ${escapeHTML(myName())}</span><span>${theirsReady ? "✓" : "○"} ${escapeHTML(partnerName())}</span></div>${open ? `<div class="answers"><div class="answer"><div class="answer-name">${escapeHTML(myName())}</div><div class="answer-text">${escapeHTML(mine)}</div></div><div class="answer partner"><div class="answer-name">${escapeHTML(partnerName())}</div><div class="answer-text">${escapeHTML(theirs)}</div></div></div>` : `<button class="button ${mineReady && theirsReady ? "primary" : "ghost"}" data-reveal="${question.id}" ${mineReady && theirsReady ? "" : "disabled"}>${mineReady && theirsReady ? (question.revealRequested ? "Revealing…" : "Reveal this answer") : "Waiting for both answers"}</button>`}</article>`;
   }).join("")}</div>${nav()}`;
-  document.querySelectorAll("[data-reveal]").forEach((button) => button.addEventListener("click", () => revealQuestion(button.dataset.reveal)));
+  document.querySelectorAll("[data-reveal]").forEach((button) => button.addEventListener("click", async () => {
+    try { await updateDoc(doc(db, "couples", coupleId, "questions", button.dataset.reveal), { revealRequested: true, updatedAt: serverTimestamp() }); }
+    catch (error) { toast(friendlyError(error)); }
+  }));
 }
 
-function revealQuestion(index) {
-  if (connectionState !== "live" || !own.answers[index] || !partner.answered[index]) return;
-  own.revealed[index] = own.answers[index];
-  saveOwn();
-  send({ type: "reveal-request", question: index, answer: own.answers[index] });
-  renderApp();
-}
+function inviteLink() { return `${location.origin}${location.pathname}#join=${coupleId}`; }
 
 function renderInvite() {
-  const isHost = profile.role === "host";
-  app.innerHTML = `${header(isHost ? "Invite your person" : "Your shared room", "Private peer-to-peer room")}<section class="card sync-card"><div class="sync-icon">🔗</div><h2>${isHost ? "Send one link" : `Joined ${escapeHTML(profile.hostName || partner.name)}'s room`}</h2><p class="muted">${isHost ? "They open it, enter their own name, and you can both start answering." : "Keep this page open for live updates. Your own answers are saved separately on this device."}</p>${isHost ? `<div class="stack"><button id="share-link" class="button primary">Share invite link</button><button id="copy-link" class="button ghost">Copy invite link</button></div>` : ""}</section><section class="card" style="margin-top:14px"><p class="eyebrow">How privacy works</p><p class="muted small">Your answer text is saved under your identity in this browser. Your partner sees only that you answered until one of you taps Reveal. Live data travels through an encrypted WebRTC connection.</p></section>${isHost ? `<button id="new-room" class="button danger" style="margin-top:14px">Create a different room</button>` : ""}${nav()}`;
-  document.querySelector("#share-link")?.addEventListener("click", shareInvite);
-  document.querySelector("#copy-link")?.addEventListener("click", copyInvite);
-  document.querySelector("#new-room")?.addEventListener("click", () => {
-    if (!confirm("Leave this room on this device and create a new one? Your current answers will remain stored, but this room will no longer open automatically.")) return;
-    localStorage.removeItem(HOST_PROFILE_KEY);
-    peer?.destroy();
-    profile = null;
-    own = { answers: {}, revealed: {} };
-    partner = { name: "Partner", answered: {}, revealed: {} };
-    customQuestions = [];
-    connectionState = "offline";
-    currentTab = "answer";
-    landing();
-  });
+  app.innerHTML = `${header("Your shared space", "Google account + Firestore")}<section class="card sync-card"><div class="sync-icon">🔗</div><h2>${partnerId() ? `${escapeHTML(myName())} + ${escapeHTML(partnerName())}` : "Invite your person"}</h2><p class="muted">${partnerId() ? "Your questions and answers are saved and will synchronize whenever either of you returns." : "Send this link. They sign in with Google, choose their name, and join your room."}</p><div class="stack"><button id="share-link" class="button primary">Share invite link</button><button id="copy-link" class="button ghost">Copy invite link</button></div></section><section class="card account-card"><div>${accountChip()}<p class="muted small">${escapeHTML(currentUser.email || "")}</p></div><button id="sign-out" class="button ghost inline">Sign out</button></section>${nav()}`;
+  document.querySelector("#share-link").addEventListener("click", shareInvite);
+  document.querySelector("#copy-link").addEventListener("click", copyInvite);
+  document.querySelector("#sign-out").addEventListener("click", () => signOut(auth));
 }
 
 async function shareInvite() {
-  const url = shareLink();
+  const url = inviteLink();
   if (navigator.share) {
-    try {
-      await navigator.share({ title: "Join me on Twogether", text: `${profile.name} invited you to answer together 💌`, url });
-      return;
-    } catch (error) { if (error.name === "AbortError") return; }
+    try { await navigator.share({ title: "Join me on Twogether", text: `${myName()} invited you to answer together 💌`, url }); return; }
+    catch (error) { if (error.name === "AbortError") return; }
   }
-  await copyInvite();
+  copyInvite();
 }
 
 async function copyInvite() {
-  const url = shareLink();
-  try {
-    await navigator.clipboard.writeText(url);
-    toast("Invite link copied");
-  } catch {
-    const overlay = document.createElement("div");
-    overlay.className = "sheet-backdrop";
-    overlay.innerHTML = `<section class="sheet"><div class="sheet-handle"></div><h2>Copy this invite</h2><div class="code-box">${escapeHTML(url)}</div><button class="button primary" id="close-code">Done</button></section>`;
-    document.body.appendChild(overlay);
-    document.querySelector("#close-code").addEventListener("click", () => overlay.remove());
-  }
+  try { await navigator.clipboard.writeText(inviteLink()); toast("Invite link copied"); }
+  catch { toast("Press and hold the address bar to copy this link"); }
 }
 
-window.addEventListener("online", () => {
-  if (!profile) return;
-  if (!peer || peer.destroyed) startPeer();
-  else if (profile.role === "guest" && !connection?.open) connectToHost();
+function friendlyError(error) {
+  const value = `${error?.code || ""} ${error?.message || ""}`;
+  if (value.includes("permission-denied")) return "Firebase permissions are not configured yet";
+  if (value.includes("invite-not-found")) return "This invitation was not found";
+  if (value.includes("room-full")) return "This room already has two people";
+  if (value.includes("unauthorized-domain")) return "Add this website to Firebase Authorized domains";
+  return "Could not save that change. Please try again.";
+}
+
+function renderSetupError(error) {
+  app.innerHTML = `<main class="welcome"><div class="brand"><span class="brand-mark">♥</span> Twogether</div><section class="card sync-card"><div class="sync-icon">⚙️</div><h2>Firebase setup needed</h2><p class="muted">${escapeHTML(friendlyError(error))}</p><button id="retry" class="button primary">Try again</button></section></main>`;
+  document.querySelector("#retry").addEventListener("click", loadAccount);
+}
+
+onAuthStateChanged(auth, (user) => {
+  cleanupRoom();
+  currentUser = user;
+  userProfile = null;
+  coupleId = null;
+  if (user) loadAccount();
+  else renderLogin();
 });
-window.addEventListener("beforeunload", () => {
-  localChannel?.close();
-  peer?.destroy();
-});
-if ("serviceWorker" in navigator && location.protocol.startsWith("http")) window.addEventListener("load", () => navigator.serviceWorker.register("sw.js"));
-renderApp();
+
+if ("serviceWorker" in navigator) window.addEventListener("load", () => navigator.serviceWorker.register("sw.js"));

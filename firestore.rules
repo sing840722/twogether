@@ -1,0 +1,83 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+    function signedIn() {
+      return request.auth != null;
+    }
+
+    function isMember(coupleId) {
+      return signedIn()
+        && get(/databases/$(database)/documents/couples/$(coupleId)).data.memberIds.hasAny([request.auth.uid]);
+    }
+
+    match /users/{userId} {
+      allow read, create, update: if signedIn() && request.auth.uid == userId;
+      allow delete: if false;
+    }
+
+    match /couples/{coupleId} {
+      // Signed-in users may open a specific invitation, but cannot list rooms.
+      allow get: if signedIn();
+      allow list: if false;
+
+      allow create: if signedIn()
+        && request.resource.data.memberIds.size() == 1
+        && request.resource.data.memberIds[0] == request.auth.uid
+        && request.resource.data.createdBy == request.auth.uid;
+
+      allow update: if signedIn() && (
+        // Existing members may not change room membership.
+        (resource.data.memberIds.hasAny([request.auth.uid])
+          && request.resource.data.memberIds == resource.data.memberIds
+          && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['names', 'updatedAt'])
+          && request.resource.data.names.diff(resource.data.names).affectedKeys().hasOnly([request.auth.uid]))
+        ||
+        // A specific invite may add only the signed-in user as member two.
+        (!resource.data.memberIds.hasAny([request.auth.uid])
+          && resource.data.memberIds.size() == 1
+          && request.resource.data.memberIds.size() == 2
+          && request.resource.data.memberIds.hasAll(resource.data.memberIds)
+          && request.resource.data.memberIds.hasAny([request.auth.uid])
+          && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['memberIds', 'names', 'updatedAt'])
+          && request.resource.data.names.diff(resource.data.names).affectedKeys().hasOnly([request.auth.uid]))
+      );
+      allow delete: if false;
+
+      match /questions/{questionId} {
+        allow read: if isMember(coupleId);
+        allow create: if isMember(coupleId)
+          && request.resource.data.createdBy == request.auth.uid;
+
+        // A member can change only their own ready/revealed entries plus the
+        // shared reveal switch. Question text and ownership stay immutable.
+        allow update: if isMember(coupleId)
+          && request.resource.data.diff(resource.data).affectedKeys()
+            .hasOnly(['ready', 'revealRequested', 'revealedAnswers', 'updatedAt'])
+          && request.resource.data.ready.diff(resource.data.ready).affectedKeys()
+            .hasOnly([request.auth.uid])
+          && request.resource.data.revealedAnswers.diff(resource.data.revealedAnswers).affectedKeys()
+            .hasOnly([request.auth.uid])
+          && (request.resource.data.revealRequested == false
+            || (get(/databases/$(database)/documents/couples/$(coupleId)).data.memberIds.size() == 2
+              && request.resource.data.ready.keys().hasAll(
+                get(/databases/$(database)/documents/couples/$(coupleId)).data.memberIds)
+              && request.resource.data.ready.values().hasOnly([true])))
+          && (request.resource.data.revealedAnswers == resource.data.revealedAnswers
+            || !request.resource.data.revealedAnswers.keys().hasAny([request.auth.uid])
+            || (request.resource.data.revealRequested
+              && request.resource.data.revealedAnswers[request.auth.uid]
+                == get(/databases/$(database)/documents/couples/$(coupleId)/questions/$(questionId)/privateAnswers/$(request.auth.uid)).data.text));
+
+        allow delete: if isMember(coupleId)
+          && !resource.data.builtIn
+          && resource.data.createdBy == request.auth.uid;
+
+        match /privateAnswers/{answerOwnerId} {
+          allow read, create, update, delete: if isMember(coupleId)
+            && request.auth.uid == answerOwnerId;
+        }
+      }
+    }
+  }
+}

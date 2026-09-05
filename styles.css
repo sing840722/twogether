@@ -72,6 +72,10 @@ input:focus, textarea:focus { border-color: var(--rose); box-shadow: 0 0 0 4px r
 .button.inline { width: auto; min-height: 40px; padding: 9px 13px; border-radius: 13px; }
 
 .topbar { display: flex; justify-content: space-between; align-items: center; margin-bottom: 27px; }
+.account-chip { display: inline-flex; max-width: 52%; align-items: center; gap: 7px; padding: 6px 9px; border-radius: 999px; background: #f3eeeb; color: var(--muted); font-size: 11px; font-weight: 800; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.account-chip img { width: 23px; height: 23px; flex: 0 0 auto; border-radius: 50%; object-fit: cover; }
+.account-card { display: flex; align-items: center; justify-content: space-between; gap: 14px; margin-top: 16px; text-align: left; }
+.account-card .muted { margin: 6px 0 0; overflow-wrap: anywhere; }
 .icon-button { width: 42px; height: 42px; border: 1px solid var(--line); border-radius: 14px; background: rgba(255,255,255,.75); color: var(--ink); font-size: 18px; }
 .hero-row { display: flex; align-items: end; justify-content: space-between; gap: 16px; margin-bottom: 20px; }
 .progress-ring { flex: 0 0 auto; width: 65px; height: 65px; display: grid; place-items: center; border-radius: 50%; background: conic-gradient(var(--rose) var(--progress), #efe6e1 0); }

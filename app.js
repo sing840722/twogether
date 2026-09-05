@@ -11,283 +11,410 @@ const QUESTIONS = [
   "What is one thing you have wanted to tell me lately?"
 ];
 
-const STORAGE_KEY = "twogether.profile.v1";
-const VAULT_KEY = "twogether.vault.v1";
-const PARTNER_KEY = "twogether.partner.v1";
+const HOST_PROFILE_KEY = "twogether.host.v2";
 const enc = new TextEncoder();
 const dec = new TextDecoder();
-
-let profile = readJSON(STORAGE_KEY);
-let key = null;
-let answers = {};
-let partnerAnswers = null;
-let currentTab = "answer";
-let pendingShare = getHashShare();
-let revealed = false;
-
 const app = document.querySelector("#app");
 
-function readJSON(name) {
-  try { return JSON.parse(localStorage.getItem(name)); } catch { return null; }
+let profile = null;
+let own = { answers: {}, revealed: {} };
+let partner = { name: "Partner", answered: {}, revealed: {} };
+let peer = null;
+let connection = null;
+let localChannel = null;
+let localLive = false;
+let connectionState = "offline";
+let currentTab = "answer";
+let reconnectTimer = null;
+let joinPayload = readJoinPayload();
+
+function readJSON(key) {
+  try { return JSON.parse(localStorage.getItem(key)); } catch { return null; }
 }
 
-function writeJSON(name, value) { localStorage.setItem(name, JSON.stringify(value)); }
+function writeJSON(key, value) { localStorage.setItem(key, JSON.stringify(value)); }
+
+function randomToken(bytes = 12) {
+  return bytesToB64(crypto.getRandomValues(new Uint8Array(bytes)));
+}
 
 function bytesToB64(bytes) {
   let binary = "";
-  bytes.forEach((b) => binary += String.fromCharCode(b));
+  bytes.forEach((byte) => binary += String.fromCharCode(byte));
   return btoa(binary).replaceAll("+", "-").replaceAll("/", "_").replaceAll("=", "");
 }
 
 function b64ToBytes(value) {
   const normalized = value.replaceAll("-", "+").replaceAll("_", "/");
   const binary = atob(normalized + "=".repeat((4 - normalized.length % 4) % 4));
-  return Uint8Array.from(binary, (c) => c.charCodeAt(0));
+  return Uint8Array.from(binary, (char) => char.charCodeAt(0));
 }
 
-async function deriveKey(coupleId, password) {
-  const material = await crypto.subtle.importKey("raw", enc.encode(password), "PBKDF2", false, ["deriveKey"]);
-  return crypto.subtle.deriveKey(
-    { name: "PBKDF2", salt: enc.encode(`twogether:v1:${coupleId.trim().toLowerCase()}`), iterations: 180000, hash: "SHA-256" },
-    material,
-    { name: "AES-GCM", length: 256 },
-    false,
-    ["encrypt", "decrypt"]
-  );
-}
+function encodePayload(value) { return bytesToB64(enc.encode(JSON.stringify(value))); }
+function decodePayload(value) { return JSON.parse(dec.decode(b64ToBytes(value))); }
 
-async function verifier(coupleId, password) {
-  const digest = await crypto.subtle.digest("SHA-256", enc.encode(`twogether-check:${coupleId.trim().toLowerCase()}:${password}`));
-  return bytesToB64(new Uint8Array(digest)).slice(0, 24);
+function readJoinPayload() {
+  try {
+    const value = new URLSearchParams(location.hash.slice(1)).get("join");
+    if (!value) return null;
+    const payload = decodePayload(value);
+    return payload.v === 2 && payload.roomId && payload.secret && payload.hostId ? payload : null;
+  } catch { return null; }
 }
-
-async function seal(value) {
-  const iv = crypto.getRandomValues(new Uint8Array(12));
-  const cipher = await crypto.subtle.encrypt({ name: "AES-GCM", iv }, key, enc.encode(JSON.stringify(value)));
-  return { iv: bytesToB64(iv), data: bytesToB64(new Uint8Array(cipher)) };
-}
-
-async function openBox(box) {
-  const plain = await crypto.subtle.decrypt({ name: "AES-GCM", iv: b64ToBytes(box.iv) }, key, b64ToBytes(box.data));
-  return JSON.parse(dec.decode(plain));
-}
-
-async function saveVault() { writeJSON(VAULT_KEY, await seal(answers)); }
 
 function escapeHTML(value = "") {
   return String(value).replace(/[&<>'"]/g, (char) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", "'": "&#39;", '"': "&quot;" })[char]);
 }
 
 function toast(message) {
-  const el = document.querySelector("#toast");
-  el.textContent = message;
-  el.classList.add("show");
+  const element = document.querySelector("#toast");
+  element.textContent = message;
+  element.classList.add("show");
   clearTimeout(toast.timer);
-  toast.timer = setTimeout(() => el.classList.remove("show"), 2200);
+  toast.timer = setTimeout(() => element.classList.remove("show"), 2400);
 }
 
-function getHashShare() {
-  const params = new URLSearchParams(location.hash.slice(1));
-  return params.get("share");
+function dataKey() { return `twogether.person.v2.${profile.roomId}.${profile.role}.${profile.participantId}`; }
+
+function saveOwn() {
+  writeJSON(dataKey(), { name: profile.name, answers: own.answers, revealed: own.revealed });
+  if (profile.role === "host") writeJSON(HOST_PROFILE_KEY, profile);
+  else writeJSON(`twogether.guest.v2.${profile.roomId}`, profile);
 }
 
-function profileForm(mode = "create") {
-  const importedId = (() => {
-    if (!pendingShare) return "";
-    try { return JSON.parse(dec.decode(b64ToBytes(pendingShare))).coupleId || ""; } catch { return ""; }
-  })();
+function loadOwn() {
+  const saved = readJSON(dataKey());
+  own = saved ? { answers: saved.answers || {}, revealed: saved.revealed || {} } : { answers: {}, revealed: {} };
+}
+
+function answeredMap() {
+  return Object.fromEntries(QUESTIONS.map((_, index) => [index, Boolean(own.answers[index])]));
+}
+
+function shareLink() {
+  const payload = encodePayload({ v: 2, roomId: profile.roomId, secret: profile.secret, hostId: profile.hostId, hostName: profile.name });
+  return `${location.origin}${location.pathname}#join=${payload}`;
+}
+
+function landing() {
+  const previous = readJSON(HOST_PROFILE_KEY);
   app.innerHTML = `
     <main class="welcome">
       <div class="brand"><span class="brand-mark">♥</span> Twogether</div>
-      <div class="heart-pair"><div class="heart one">💌</div><div class="heart two">🔐</div></div>
-      <p class="eyebrow">Answer privately · reveal together</p>
-      <h1>${mode === "unlock" ? "Welcome back." : "Just the two of you."}</h1>
-      <p class="welcome-copy">${mode === "unlock" ? `Unlock your private answers for <strong>${escapeHTML(profile.coupleId)}</strong>.` : "A tiny private question game for you and your favorite person."}</p>
-      <form id="profile-form" class="card stack">
-        ${mode === "create" ? `
-          <div class="field"><label for="coupleId">Couple ID</label><input id="coupleId" required maxlength="24" value="${escapeHTML(importedId)}" placeholder="e.g. mango-moon" autocapitalize="none" autocomplete="off"></div>
-          <div class="field"><label for="myName">Your name</label><input id="myName" required maxlength="24" placeholder="Your name" autocomplete="nickname"></div>
-          <div class="field"><label for="partnerName">Partner's name</label><input id="partnerName" required maxlength="24" placeholder="Their name" autocomplete="off"></div>
-        ` : ""}
-        <div class="field"><label for="password">Shared password</label><input id="password" type="password" required minlength="6" placeholder="At least 6 characters" autocomplete="current-password"></div>
-        <button class="button primary" type="submit">${mode === "unlock" ? "Unlock" : "Create our space"}</button>
-        ${mode === "unlock" ? `<button id="use-different" class="button ghost" type="button">Use a different couple ID</button>` : ""}
-        <div class="privacy-note"><span>🔒</span><span>Your password and answers never leave your devices unencrypted. If you forget the password, the answers cannot be recovered.</span></div>
+      <div class="heart-pair"><div class="heart one">💌</div><div class="heart two">⚡</div></div>
+      <p class="eyebrow">Private answers · live reveal</p>
+      <h1>Just the two of you.</h1>
+      <p class="welcome-copy">Create a private room, send one link, and answer together in real time.</p>
+      ${previous ? `<button id="continue-room" class="button secondary" style="margin-bottom:12px">Continue as ${escapeHTML(previous.name)}</button>` : ""}
+      <form id="create-form" class="card stack">
+        <div class="field"><label for="name">Your name</label><input id="name" required maxlength="24" placeholder="Your name" autocomplete="nickname"></div>
+        <div class="field"><label for="share-code">Private share code</label><input id="share-code" required minlength="6" maxlength="40" placeholder="Something only you would choose" autocomplete="off"></div>
+        <button class="button primary" type="submit">Generate our link</button>
+        <div class="privacy-note"><span>🔒</span><span>The code creates a unique room link. Unrevealed answer text stays on your own device.</span></div>
       </form>
     </main>`;
-
-  document.querySelector("#profile-form").addEventListener("submit", async (event) => {
+  document.querySelector("#continue-room")?.addEventListener("click", () => resumeHost(previous));
+  document.querySelector("#create-form").addEventListener("submit", async (event) => {
     event.preventDefault();
-    const password = document.querySelector("#password").value;
-    if (mode === "unlock") {
-      if (await verifier(profile.coupleId, password) !== profile.verifier) return toast("That password doesn't match");
-      key = await deriveKey(profile.coupleId, password);
-      try {
-        const vault = readJSON(VAULT_KEY);
-        answers = vault ? await openBox(vault) : {};
-        const storedPartner = readJSON(PARTNER_KEY);
-        partnerAnswers = storedPartner ? await openBox(storedPartner) : null;
-      } catch { return toast("Could not open the saved answers"); }
-    } else {
-      const coupleId = document.querySelector("#coupleId").value.trim().toLowerCase().replace(/\s+/g, "-");
-      profile = {
-        coupleId,
-        myName: document.querySelector("#myName").value.trim(),
-        partnerName: document.querySelector("#partnerName").value.trim(),
-        verifier: await verifier(coupleId, password)
-      };
-      key = await deriveKey(coupleId, password);
-      writeJSON(STORAGE_KEY, profile);
-      answers = {};
-      await saveVault();
+    const name = document.querySelector("#name").value.trim();
+    const code = document.querySelector("#share-code").value;
+    const salt = randomToken(12);
+    const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", enc.encode(`${code}:${salt}`)));
+    const roomId = bytesToB64(digest).slice(0, 14);
+    profile = { role: "host", name, roomId, secret: bytesToB64(digest), hostId: `twogether-${roomId}`, participantId: randomToken(9) };
+    own = { answers: {}, revealed: {} };
+    saveOwn();
+    renderApp();
+    startPeer();
+  });
+}
+
+function resumeHost(previous) {
+  profile = previous;
+  loadOwn();
+  renderApp();
+  startPeer();
+}
+
+function joinScreen(payload) {
+  const previous = readJSON(`twogether.guest.v2.${payload.roomId}`);
+  app.innerHTML = `
+    <main class="welcome">
+      <div class="brand"><span class="brand-mark">♥</span> Twogether</div>
+      <div class="heart-pair"><div class="heart one">👋</div><div class="heart two">💞</div></div>
+      <p class="eyebrow">You're invited</p>
+      <h1>Join ${escapeHTML(payload.hostName || "your partner")}.</h1>
+      <p class="welcome-copy">Put your name down and your shared question room will open.</p>
+      <form id="join-form" class="card stack">
+        <div class="field"><label for="name">Your name</label><input id="name" required maxlength="24" value="${escapeHTML(previous?.name || "")}" placeholder="Your name" autocomplete="nickname"></div>
+        <button class="button primary" type="submit">Start answering</button>
+        <div class="privacy-note"><span>⚡</span><span>Live answers work while both of you have the app open and are online.</span></div>
+      </form>
+    </main>`;
+  document.querySelector("#join-form").addEventListener("submit", (event) => {
+    event.preventDefault();
+    const name = document.querySelector("#name").value.trim();
+    profile = { role: "guest", name, roomId: payload.roomId, secret: payload.secret, hostId: payload.hostId, hostName: payload.hostName, participantId: previous?.participantId || randomToken(9) };
+    loadOwn();
+    saveOwn();
+    partner.name = payload.hostName || "Partner";
+    renderApp();
+    startPeer();
+  });
+}
+
+function startPeer() {
+  if (!window.Peer) {
+    connectionState = "error";
+    renderApp();
+    return toast("Live connection library could not load");
+  }
+  clearTimeout(reconnectTimer);
+  peer?.destroy();
+  localChannel?.close();
+  connection = null;
+  localLive = false;
+  connectionState = "connecting";
+  renderApp();
+  localChannel = new BroadcastChannel(`twogether-live-${profile.roomId}`);
+  localChannel.onmessage = (event) => {
+    const message = event.data;
+    if (!message || message.senderId === profile.participantId) return;
+    localLive = true;
+    connectionState = "live";
+    receive(message);
+    if (message.type === "hello" && message.requestReply) sendHello(false);
+  };
+  sendHello(true);
+  peer = profile.role === "host" ? new Peer(profile.hostId, { debug: 1 }) : new Peer({ debug: 1 });
+  peer.on("open", () => {
+    connectionState = "waiting";
+    renderApp();
+    if (profile.role === "guest") connectToHost();
+  });
+  peer.on("connection", (incoming) => {
+    if (profile.role !== "host" || incoming.metadata?.roomId !== profile.roomId || incoming.metadata?.secret !== profile.secret) return incoming.close();
+    setupConnection(incoming);
+  });
+  peer.on("disconnected", () => {
+    connectionState = localLive ? "live" : "offline";
+    renderApp();
+    try { peer.reconnect(); } catch { /* handled by normal retry */ }
+  });
+  peer.on("error", (error) => {
+    if (error.type === "peer-unavailable" && profile.role === "guest") {
+      connectionState = localLive ? "live" : "waiting";
+      renderApp();
+      scheduleReconnect();
+      return;
     }
-    if (pendingShare) await importShare(pendingShare, true);
-    history.replaceState(null, "", location.pathname + location.search);
+    connectionState = localLive ? "live" : "error";
+    renderApp();
+    toast(error.type === "unavailable-id" ? "This room is already open in another tab" : "Live connection interrupted");
+  });
+}
+
+function connectToHost() {
+  if (!peer || peer.destroyed || connection?.open) return;
+  setupConnection(peer.connect(profile.hostId, { reliable: true, metadata: { roomId: profile.roomId, secret: profile.secret, name: profile.name, participantId: profile.participantId } }));
+}
+
+function scheduleReconnect() {
+  clearTimeout(reconnectTimer);
+  reconnectTimer = setTimeout(connectToHost, 4000);
+}
+
+function setupConnection(nextConnection) {
+  if (connection && connection !== nextConnection) connection.close();
+  connection = nextConnection;
+  connection.on("open", () => {
+    clearTimeout(reconnectTimer);
+    connectionState = "live";
+    sendHello(false);
     renderApp();
   });
-
-  document.querySelector("#use-different")?.addEventListener("click", () => {
-    if (!confirm("Remove this local profile from this phone?")) return;
-    localStorage.removeItem(STORAGE_KEY); localStorage.removeItem(VAULT_KEY); localStorage.removeItem(PARTNER_KEY);
-    profile = null; key = null; answers = {}; partnerAnswers = null; profileForm("create");
+  connection.on("data", receive);
+  connection.on("close", () => {
+    if (connection !== nextConnection) return;
+    connection = null;
+    connectionState = localLive ? "live" : "waiting";
+    renderApp();
+    if (profile.role === "guest") scheduleReconnect();
   });
+  connection.on("error", () => {
+    connectionState = "error";
+    renderApp();
+  });
+}
+
+function send(message) {
+  const wireMessage = { ...message, senderId: profile.participantId };
+  localChannel?.postMessage(wireMessage);
+  if (connection?.open) connection.send(wireMessage);
+}
+
+function sendHello(requestReply) {
+  send({ type: "hello", requestReply, name: profile.name, participantId: profile.participantId, answered: answeredMap(), revealed: own.revealed });
+}
+
+function receive(message) {
+  if (!message || typeof message !== "object") return;
+  if (message.type === "hello") {
+    partner.name = String(message.name || "Partner").slice(0, 24);
+    partner.answered = message.answered || {};
+    partner.revealed = message.revealed || {};
+    if (profile.role === "host") profile.partnerName = partner.name;
+    saveOwn();
+  }
+  if (message.type === "answer-status") {
+    partner.answered[message.question] = Boolean(message.answered);
+    delete partner.revealed[message.question];
+    delete own.revealed[message.question];
+    saveOwn();
+  }
+  if (message.type === "reveal-request") {
+    partner.revealed[message.question] = String(message.answer || "");
+    if (own.answers[message.question]) {
+      own.revealed[message.question] = own.answers[message.question];
+      saveOwn();
+      send({ type: "revealed", question: message.question, answer: own.answers[message.question] });
+    }
+  }
+  if (message.type === "revealed") partner.revealed[message.question] = String(message.answer || "");
+  renderApp();
+}
+
+function statusMarkup() {
+  const states = {
+    live: ["live", `${escapeHTML(partner.name)} is here`],
+    connecting: ["connecting", "Connecting…"],
+    waiting: ["waiting", profile.role === "host" ? "Waiting for partner" : `Waiting for ${escapeHTML(profile.hostName || "partner")}`],
+    offline: ["offline", "Offline"],
+    error: ["offline", "Connection issue"]
+  };
+  const [className, label] = states[connectionState];
+  return `<span class="live-pill ${className}"><span class="live-dot"></span>${label}</span>`;
 }
 
 function header(title, subtitle) {
-  return `<header class="topbar"><div class="brand"><span class="brand-mark">♥</span> Twogether</div><button class="icon-button" id="settings" aria-label="Settings">⚙</button></header>
-    <section class="hero-row"><div><p class="eyebrow">${escapeHTML(subtitle)}</p><h2>${escapeHTML(title)}</h2></div></section>`;
+  return `<header class="topbar"><div class="brand"><span class="brand-mark">♥</span> Twogether</div>${statusMarkup()}</header><section class="hero-row"><div><p class="eyebrow">${escapeHTML(subtitle)}</p><h2>${escapeHTML(title)}</h2></div></section>`;
 }
 
 function nav() {
-  return `<nav class="bottom-nav" aria-label="Main navigation">
-    ${[["answer","✎","Answer"],["sync","↗","Share"],["reveal","♥","Reveal"]].map(([id, icon, label]) => `<button class="nav-item ${currentTab === id ? "active" : ""}" data-tab="${id}"><span class="nav-icon">${icon}</span>${label}</button>`).join("")}
-  </nav>`;
+  return `<nav class="bottom-nav" aria-label="Main navigation">${[["answer","✎","Answer"],["together","♥","Together"],["invite","↗","Invite"]].map(([id, icon, label]) => `<button class="nav-item ${currentTab === id ? "active" : ""}" data-tab="${id}"><span class="nav-icon">${icon}</span>${label}</button>`).join("")}</nav>`;
 }
 
 function renderApp() {
-  if (!profile) return profileForm("create");
-  if (!key) return profileForm("unlock");
+  if (!profile) return joinPayload ? joinScreen(joinPayload) : landing();
   if (currentTab === "answer") renderQuestions();
-  if (currentTab === "sync") renderSync();
-  if (currentTab === "reveal") renderReveal();
-  document.querySelectorAll("[data-tab]").forEach((button) => button.addEventListener("click", () => { currentTab = button.dataset.tab; revealed = false; renderApp(); }));
-  document.querySelector("#settings")?.addEventListener("click", renderSettings);
+  if (currentTab === "together") renderTogether();
+  if (currentTab === "invite") renderInvite();
+  document.querySelectorAll("[data-tab]").forEach((button) => button.addEventListener("click", () => {
+    currentTab = button.dataset.tab;
+    renderApp();
+  }));
 }
 
 function renderQuestions() {
-  const count = Object.values(answers).filter(Boolean).length;
-  app.innerHTML = `${header(`Hi, ${profile.myName}`, `${profile.coupleId} · your answers`)}
-    <section class="hero-row"><p class="muted" style="margin:0">Take your time. ${profile.partnerName} can't see these yet.</p><div class="progress-ring" style="--progress:${count / QUESTIONS.length * 360}deg"><span>${count}/${QUESTIONS.length}</span></div></section>
-    <div class="question-list">${QUESTIONS.map((question, index) => `<button class="question ${answers[index] ? "done" : ""}" data-question="${index}"><span class="question-number">${answers[index] ? "✓" : index + 1}</span><span class="question-title">${escapeHTML(question)}</span><span class="question-status">›</span></button>`).join("")}</div>${nav()}`;
+  const count = Object.values(own.answers).filter(Boolean).length;
+  app.innerHTML = `${header(`Hi, ${profile.name}`, "Your private answers")}<section class="hero-row"><p class="muted" style="margin:0">Saved as you. Your words stay here until reveal.</p><div class="progress-ring" style="--progress:${count / QUESTIONS.length * 360}deg"><span>${count}/${QUESTIONS.length}</span></div></section><div class="question-list">${QUESTIONS.map((question, index) => `<button class="question ${own.answers[index] ? "done" : ""}" data-question="${index}"><span class="question-number">${own.answers[index] ? "✓" : index + 1}</span><span class="question-title">${escapeHTML(question)}</span><span class="question-status">›</span></button>`).join("")}</div>${nav()}`;
   document.querySelectorAll("[data-question]").forEach((button) => button.addEventListener("click", () => editAnswer(Number(button.dataset.question))));
 }
 
 function editAnswer(index) {
   const overlay = document.createElement("div");
   overlay.className = "sheet-backdrop";
-  overlay.innerHTML = `<section class="sheet"><div class="sheet-handle"></div><p class="eyebrow">Question ${index + 1}</p><h2>${escapeHTML(QUESTIONS[index])}</h2><div class="field" style="margin-top:18px"><label for="answer">Your answer</label><textarea id="answer" maxlength="600" placeholder="Write what feels true…">${escapeHTML(answers[index] || "")}</textarea></div><div class="sheet-actions"><button class="button ghost" id="cancel">Cancel</button><button class="button primary" id="save">Save privately</button></div></section>`;
+  overlay.innerHTML = `<section class="sheet"><div class="sheet-handle"></div><p class="eyebrow">${escapeHTML(profile.name)} · Question ${index + 1}</p><h2>${escapeHTML(QUESTIONS[index])}</h2><div class="field" style="margin-top:18px"><label for="answer">Your answer</label><textarea id="answer" maxlength="600" placeholder="Write what feels true…">${escapeHTML(own.answers[index] || "")}</textarea></div><div class="sheet-actions"><button class="button ghost" id="cancel">Cancel</button><button class="button primary" id="save">Save as ${escapeHTML(profile.name)}</button></div></section>`;
   document.body.appendChild(overlay);
   const close = () => overlay.remove();
-  overlay.addEventListener("click", (e) => { if (e.target === overlay) close(); });
+  overlay.addEventListener("click", (event) => { if (event.target === overlay) close(); });
   document.querySelector("#cancel").addEventListener("click", close);
-  document.querySelector("#save").addEventListener("click", async () => {
+  document.querySelector("#save").addEventListener("click", () => {
     const value = document.querySelector("#answer").value.trim();
-    if (value) answers[index] = value; else delete answers[index];
-    await saveVault(); close(); renderApp(); toast("Saved on this phone");
+    if (value) own.answers[index] = value;
+    else delete own.answers[index];
+    delete own.revealed[index];
+    delete partner.revealed[index];
+    saveOwn();
+    send({ type: "answer-status", question: index, answered: Boolean(value) });
+    close();
+    renderApp();
+    toast(`Saved as ${profile.name}`);
   });
   document.querySelector("#answer").focus();
 }
 
-async function makeSharePayload() {
-  return bytesToB64(enc.encode(JSON.stringify({ v: 1, coupleId: profile.coupleId, owner: profile.myName, box: await seal({ answers, sentAt: Date.now() }) })));
+function renderTogether() {
+  const matching = QUESTIONS.map((_, index) => index).filter((index) => own.answers[index] && partner.answered[index]);
+  const partnerName = partner.name || profile.partnerName || profile.hostName || "Partner";
+  app.innerHTML = `${header("Reveal together", "Updates live")}<section class="card sync-card"><div class="sync-icon">${connectionState === "live" ? "✨" : "⏳"}</div><h2>${connectionState === "live" ? `${matching.length} ready` : "Waiting to reconnect"}</h2><p class="muted">When either of you reveals a question, it opens instantly on both screens.</p></section><div class="reveal-grid">${QUESTIONS.map((question, index) => {
+    const mineAnswered = Boolean(own.answers[index]);
+    const theirsAnswered = Boolean(partner.answered[index]);
+    const open = Boolean(own.revealed[index] && partner.revealed[index]);
+    return `<article class="reveal-card"><p class="reveal-question">${escapeHTML(question)}</p><div class="ready-row"><span>${mineAnswered ? "✓" : "○"} ${escapeHTML(profile.name)}</span><span>${theirsAnswered ? "✓" : "○"} ${escapeHTML(partnerName)}</span></div>${open ? `<div class="answers"><div class="answer"><div class="answer-name">${escapeHTML(profile.name)}</div><div class="answer-text">${escapeHTML(own.revealed[index])}</div></div><div class="answer partner"><div class="answer-name">${escapeHTML(partnerName)}</div><div class="answer-text">${escapeHTML(partner.revealed[index])}</div></div></div>` : `<button class="button ${mineAnswered && theirsAnswered ? "primary" : "ghost"}" data-reveal="${index}" ${connectionState === "live" && mineAnswered && theirsAnswered ? "" : "disabled"}>${mineAnswered && theirsAnswered ? "Reveal this answer" : "Waiting for both answers"}</button>`}</article>`;
+  }).join("")}</div>${nav()}`;
+  document.querySelectorAll("[data-reveal]").forEach((button) => button.addEventListener("click", () => revealQuestion(Number(button.dataset.reveal))));
 }
 
-function renderSync() {
-  const count = Object.values(answers).filter(Boolean).length;
-  app.innerHTML = `${header("Exchange answers", "Private handoff")}
-    <div class="stack">
-      <section class="card sync-card"><div class="sync-icon">💌</div><h2>Send yours</h2><p class="muted">Creates an encrypted link you can send to ${escapeHTML(profile.partnerName)}. Only your shared password can open it.</p><p class="small"><strong>${count}</strong> answered question${count === 1 ? "" : "s"}</p><div class="stack"><button id="share" class="button primary" ${count ? "" : "disabled"}>Share my answers</button><button id="copy-link" class="button ghost" ${count ? "" : "disabled"}>Copy encrypted link</button></div></section>
-      <section class="card sync-card"><div class="sync-icon">📥</div><h2>Receive theirs</h2><p class="muted">Open their link, or paste the answer code here.</p>${partnerAnswers ? `<p><span class="status-pill"><span class="dot"></span> ${escapeHTML(profile.partnerName)}'s answers received</span></p>` : ""}<div class="field" style="text-align:left"><label for="import-code">Answer code</label><textarea id="import-code" style="min-height:82px" placeholder="Paste code here"></textarea></div><button id="import" class="button secondary">Import answers</button></section>
-    </div>${nav()}`;
-  document.querySelector("#share").addEventListener("click", shareAnswers);
-  document.querySelector("#copy-link").addEventListener("click", copyAnswerLink);
-  document.querySelector("#import").addEventListener("click", async () => {
-    let value = document.querySelector("#import-code").value.trim();
-    if (value.includes("#share=")) value = new URL(value).hash.slice(7);
-    if (await importShare(value)) { renderApp(); toast("Answers received — still hidden"); }
+function revealQuestion(index) {
+  if (connectionState !== "live" || !own.answers[index] || !partner.answered[index]) return;
+  own.revealed[index] = own.answers[index];
+  saveOwn();
+  send({ type: "reveal-request", question: index, answer: own.answers[index] });
+  renderApp();
+}
+
+function renderInvite() {
+  const isHost = profile.role === "host";
+  app.innerHTML = `${header(isHost ? "Invite your person" : "Your shared room", "Private peer-to-peer room")}<section class="card sync-card"><div class="sync-icon">🔗</div><h2>${isHost ? "Send one link" : `Joined ${escapeHTML(profile.hostName || partner.name)}'s room`}</h2><p class="muted">${isHost ? "They open it, enter their own name, and you can both start answering." : "Keep this page open for live updates. Your own answers are saved separately on this device."}</p>${isHost ? `<div class="stack"><button id="share-link" class="button primary">Share invite link</button><button id="copy-link" class="button ghost">Copy invite link</button></div>` : ""}</section><section class="card" style="margin-top:14px"><p class="eyebrow">How privacy works</p><p class="muted small">Your answer text is saved under your identity in this browser. Your partner sees only that you answered until one of you taps Reveal. Live data travels through an encrypted WebRTC connection.</p></section>${isHost ? `<button id="new-room" class="button danger" style="margin-top:14px">Create a different room</button>` : ""}${nav()}`;
+  document.querySelector("#share-link")?.addEventListener("click", shareInvite);
+  document.querySelector("#copy-link")?.addEventListener("click", copyInvite);
+  document.querySelector("#new-room")?.addEventListener("click", () => {
+    if (!confirm("Leave this room on this device and create a new one? Your current answers will remain stored, but this room will no longer open automatically.")) return;
+    localStorage.removeItem(HOST_PROFILE_KEY);
+    peer?.destroy();
+    profile = null;
+    own = { answers: {}, revealed: {} };
+    partner = { name: "Partner", answered: {}, revealed: {} };
+    connectionState = "offline";
+    currentTab = "answer";
+    landing();
   });
 }
 
-async function shareAnswers() {
-  const payload = await makeSharePayload();
-  const url = `${location.origin}${location.pathname}#share=${payload}`;
+async function shareInvite() {
+  const url = shareLink();
   if (navigator.share) {
-    try { await navigator.share({ title: "My Twogether answers", text: `I answered our questions 💌 Open this link and use our shared password.`, url }); return; } catch (error) { if (error.name === "AbortError") return; }
+    try {
+      await navigator.share({ title: "Join me on Twogether", text: `${profile.name} invited you to answer together 💌`, url });
+      return;
+    } catch (error) { if (error.name === "AbortError") return; }
   }
-  try { await navigator.clipboard.writeText(url); toast("Encrypted link copied"); }
-  catch { showShareCode(url); }
+  await copyInvite();
 }
 
-async function copyAnswerLink() {
-  const payload = await makeSharePayload();
-  const url = `${location.origin}${location.pathname}#share=${payload}`;
-  try { await navigator.clipboard.writeText(url); toast("Encrypted link copied"); }
-  catch { showShareCode(url); }
-}
-
-function showShareCode(value) {
-  const overlay = document.createElement("div"); overlay.className = "sheet-backdrop";
-  overlay.innerHTML = `<section class="sheet"><div class="sheet-handle"></div><h2>Copy this link</h2><p class="muted">Send it only to ${escapeHTML(profile.partnerName)}.</p><div class="code-box">${escapeHTML(value)}</div><button class="button primary" id="close-code">Done</button></section>`;
-  document.body.appendChild(overlay); document.querySelector("#close-code").addEventListener("click", () => overlay.remove());
-}
-
-async function importShare(payload, quiet = false) {
+async function copyInvite() {
+  const url = shareLink();
   try {
-    const pack = JSON.parse(dec.decode(b64ToBytes(payload)));
-    if (pack.v !== 1 || pack.coupleId !== profile.coupleId) throw new Error("different couple");
-    const opened = await openBox(pack.box);
-    partnerAnswers = { owner: pack.owner, ...opened };
-    writeJSON(PARTNER_KEY, await seal(partnerAnswers));
-    pendingShare = null;
-    return true;
-  } catch (error) {
-    if (!quiet) toast(error.message === "different couple" ? "This link is for a different couple ID" : "Could not open that code");
-    return false;
+    await navigator.clipboard.writeText(url);
+    toast("Invite link copied");
+  } catch {
+    const overlay = document.createElement("div");
+    overlay.className = "sheet-backdrop";
+    overlay.innerHTML = `<section class="sheet"><div class="sheet-handle"></div><h2>Copy this invite</h2><div class="code-box">${escapeHTML(url)}</div><button class="button primary" id="close-code">Done</button></section>`;
+    document.body.appendChild(overlay);
+    document.querySelector("#close-code").addEventListener("click", () => overlay.remove());
   }
 }
 
-function renderReveal() {
-  const theirs = partnerAnswers?.answers || {};
-  const shared = QUESTIONS.map((_, i) => i).filter((i) => answers[i] && theirs[i]);
-  app.innerHTML = `${header("The big reveal", partnerAnswers ? "Both sides are here" : "Waiting for their answers")}
-    <section class="card sync-card">
-      <div class="sync-icon">${partnerAnswers ? "✨" : "⏳"}</div>
-      <h2>${partnerAnswers ? `${shared.length} ready to reveal` : `Ask ${escapeHTML(profile.partnerName)} to share`}</h2>
-      <p class="muted">${partnerAnswers ? "Sit together, count to three, and uncover your answers." : "Once you import their encrypted link, your matching answers will appear here."}</p>
-      ${partnerAnswers ? `<button id="reveal-all" class="button primary" ${shared.length ? "" : "disabled"}>${revealed ? "Hide answers" : "Reveal together"}</button>` : `<button class="button secondary" data-go-sync>Go to sharing</button>`}
-    </section>
-    <div class="reveal-grid">${shared.map((index) => `<article class="reveal-card"><p class="reveal-question">${escapeHTML(QUESTIONS[index])}</p><div class="answers"><div class="answer ${revealed ? "" : "covered"}"><div><div class="answer-name">${escapeHTML(profile.myName)}</div><div class="answer-text">${revealed ? escapeHTML(answers[index]) : "Secret answer"}</div></div></div><div class="answer partner ${revealed ? "" : "covered"}"><div><div class="answer-name">${escapeHTML(profile.partnerName)}</div><div class="answer-text">${revealed ? escapeHTML(theirs[index]) : "Secret answer"}</div></div></div></div></article>`).join("") || (partnerAnswers ? `<div class="empty">You don't have any matching answered questions yet.</div>` : "")}</div>${nav()}`;
-  document.querySelector("#reveal-all")?.addEventListener("click", () => { revealed = !revealed; renderApp(); });
-  document.querySelector("[data-go-sync]")?.addEventListener("click", () => { currentTab = "sync"; renderApp(); });
-}
-
-function renderSettings() {
-  const overlay = document.createElement("div"); overlay.className = "sheet-backdrop";
-  overlay.innerHTML = `<section class="sheet"><div class="sheet-handle"></div><p class="eyebrow">Settings</p><h2>${escapeHTML(profile.coupleId)}</h2><p class="muted">${escapeHTML(profile.myName)} + ${escapeHTML(profile.partnerName)}</p><div class="divider"></div><div class="privacy-note"><span>☁️</span><span><strong>No account. No database.</strong><br>Everything is stored on this phone. Shared links contain encrypted answers.</span></div><div class="stack" style="margin-top:18px"><button class="button ghost" id="lock">Lock now</button><button class="button danger" id="reset">Erase this phone's data</button><button class="button secondary" id="close-settings">Done</button></div></section>`;
-  document.body.appendChild(overlay);
-  document.querySelector("#close-settings").addEventListener("click", () => overlay.remove());
-  document.querySelector("#lock").addEventListener("click", () => { key = null; answers = {}; partnerAnswers = null; overlay.remove(); profileForm("unlock"); });
-  document.querySelector("#reset").addEventListener("click", () => {
-    if (!confirm("Erase your profile and all answers stored on this phone? This cannot be undone.")) return;
-    localStorage.removeItem(STORAGE_KEY); localStorage.removeItem(VAULT_KEY); localStorage.removeItem(PARTNER_KEY);
-    profile = null; key = null; answers = {}; partnerAnswers = null; overlay.remove(); profileForm("create");
-  });
-}
-
-window.addEventListener("hashchange", async () => {
-  pendingShare = getHashShare();
-  if (pendingShare && key && await importShare(pendingShare)) { history.replaceState(null, "", location.pathname + location.search); currentTab = "reveal"; renderApp(); toast("Answers received — reveal when you're together"); }
+window.addEventListener("online", () => {
+  if (!profile) return;
+  if (!peer || peer.destroyed) startPeer();
+  else if (profile.role === "guest" && !connection?.open) connectToHost();
 });
-
+window.addEventListener("beforeunload", () => {
+  localChannel?.close();
+  peer?.destroy();
+});
 if ("serviceWorker" in navigator && location.protocol.startsWith("http")) window.addEventListener("load", () => navigator.serviceWorker.register("sw.js"));
 renderApp();

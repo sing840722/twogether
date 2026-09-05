@@ -95,6 +95,13 @@ input:focus, textarea:focus { border-color: var(--rose); box-shadow: 0 0 0 4px r
 .code-box { margin: 14px 0; padding: 14px; border: 1px dashed #d7c6bd; border-radius: 15px; background: #faf5f2; word-break: break-all; font: 11px/1.35 ui-monospace, SFMono-Regular, Menlo, monospace; color: var(--muted); }
 .status-pill { display: inline-flex; align-items: center; gap: 7px; padding: 7px 11px; border-radius: 999px; background: #edf4ef; color: #4e725e; font-size: 12px; font-weight: 800; }
 .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--sage); }
+.live-pill { display: inline-flex; align-items: center; gap: 7px; max-width: 180px; padding: 7px 10px; border-radius: 999px; background: #f3eeeb; color: var(--muted); font-size: 11px; font-weight: 800; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.live-pill.live { background: #e5f1e9; color: #4e725e; }
+.live-pill.connecting, .live-pill.waiting { background: #fff0da; color: #976c34; }
+.live-dot { flex: 0 0 auto; width: 7px; height: 7px; border-radius: 50%; background: #aaa09b; }
+.live .live-dot { background: #65a47f; box-shadow: 0 0 0 3px rgba(101,164,127,.15); }
+.connecting .live-dot, .waiting .live-dot { background: #d9a654; }
+.ready-row { display: flex; justify-content: space-between; gap: 10px; margin: 0 0 13px; color: var(--muted); font-size: 12px; font-weight: 800; }
 
 .reveal-grid { display: grid; gap: 15px; margin-top: 20px; }
 .reveal-card { padding: 19px; border: 1px solid var(--line); border-radius: 22px; background: rgba(255,255,255,.85); }

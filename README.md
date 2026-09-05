@@ -8,8 +8,9 @@ A small, private, real-time couple-question app designed for iPhone and GitHub P
 2. Twogether generates an invite link to send through Messages.
 3. The second person opens the link and enters their own name.
 4. Both answer questions on their own phone.
-5. Each screen updates live to show which questions both people answered.
-6. Either person taps **Reveal this answer** and it opens on both screens at once.
+5. Either person can add a custom question, which appears live for both people.
+6. Each screen updates live to show which questions both people answered.
+7. Either person taps **Reveal this answer** and it opens on both screens at once.
 
 Answers are saved separately by room, role, and participant ID. This also means the host and invite link can be tested in two tabs of the same browser without sharing one person's answers.
 

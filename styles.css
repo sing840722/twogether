@@ -83,7 +83,9 @@ input:focus, textarea:focus { border-color: var(--rose); box-shadow: 0 0 0 4px r
 .question-number { width: 36px; height: 36px; display: grid; place-items: center; border-radius: 12px; background: #f5eeea; color: var(--muted); font-size: 13px; font-weight: 800; }
 .question.done .question-number { background: #e4f0e8; color: #557866; }
 .question-title { line-height: 1.25; font-weight: 750; }
+.question-title small { display: block; margin-top: 5px; color: var(--muted); font-size: 10px; font-weight: 700; }
 .question-status { color: var(--muted); font-size: 18px; }
+.add-question { margin-bottom: 13px; }
 
 .bottom-nav { position: fixed; z-index: 10; left: 50%; bottom: calc(10px + env(safe-area-inset-bottom)); transform: translateX(-50%); width: min(calc(100% - 28px), 530px); display: grid; grid-template-columns: repeat(3,1fr); gap: 5px; padding: 7px; border: 1px solid rgba(230,218,212,.9); border-radius: 22px; background: rgba(255,252,250,.88); box-shadow: 0 14px 35px rgba(70,46,40,.14); backdrop-filter: blur(20px); }
 .nav-item { min-height: 50px; border: 0; border-radius: 16px; background: transparent; color: var(--muted); font-size: 12px; font-weight: 750; }

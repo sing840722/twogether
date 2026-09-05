@@ -19,6 +19,7 @@ const app = document.querySelector("#app");
 let profile = null;
 let own = { answers: {}, revealed: {} };
 let partner = { name: "Partner", answered: {}, revealed: {} };
+let customQuestions = [];
 let peer = null;
 let connection = null;
 let localChannel = null;
@@ -76,8 +77,24 @@ function toast(message) {
 
 function dataKey() { return `twogether.person.v2.${profile.roomId}.${profile.role}.${profile.participantId}`; }
 
+function allQuestions() {
+  return [
+    ...QUESTIONS.map((text, index) => ({ id: String(index), text, author: null })),
+    ...customQuestions
+  ];
+}
+
+function mergeCustomQuestions(incoming = []) {
+  const byId = new Map(customQuestions.map((question) => [question.id, question]));
+  incoming.forEach((question) => {
+    if (!question || !/^c_[A-Za-z0-9_-]+$/.test(question.id) || typeof question.text !== "string") return;
+    byId.set(question.id, { id: question.id, text: question.text.trim().slice(0, 180), author: String(question.author || "Partner").slice(0, 24) });
+  });
+  customQuestions = [...byId.values()].filter((question) => question.text);
+}
+
 function saveOwn() {
-  writeJSON(dataKey(), { name: profile.name, answers: own.answers, revealed: own.revealed });
+  writeJSON(dataKey(), { name: profile.name, answers: own.answers, revealed: own.revealed, customQuestions });
   if (profile.role === "host") writeJSON(HOST_PROFILE_KEY, profile);
   else writeJSON(`twogether.guest.v2.${profile.roomId}`, profile);
 }
@@ -85,10 +102,11 @@ function saveOwn() {
 function loadOwn() {
   const saved = readJSON(dataKey());
   own = saved ? { answers: saved.answers || {}, revealed: saved.revealed || {} } : { answers: {}, revealed: {} };
+  customQuestions = saved?.customQuestions || [];
 }
 
 function answeredMap() {
-  return Object.fromEntries(QUESTIONS.map((_, index) => [index, Boolean(own.answers[index])]));
+  return Object.fromEntries(allQuestions().map((question) => [question.id, Boolean(own.answers[question.id])]));
 }
 
 function shareLink() {
@@ -123,6 +141,7 @@ function landing() {
     const roomId = bytesToB64(digest).slice(0, 14);
     profile = { role: "host", name, roomId, secret: bytesToB64(digest), hostId: `twogether-${roomId}`, participantId: randomToken(9) };
     own = { answers: {}, revealed: {} };
+    customQuestions = [];
     saveOwn();
     renderApp();
     startPeer();
@@ -254,16 +273,21 @@ function send(message) {
 }
 
 function sendHello(requestReply) {
-  send({ type: "hello", requestReply, name: profile.name, participantId: profile.participantId, answered: answeredMap(), revealed: own.revealed });
+  send({ type: "hello", requestReply, name: profile.name, participantId: profile.participantId, answered: answeredMap(), revealed: own.revealed, customQuestions });
 }
 
 function receive(message) {
   if (!message || typeof message !== "object") return;
   if (message.type === "hello") {
+    mergeCustomQuestions(message.customQuestions);
     partner.name = String(message.name || "Partner").slice(0, 24);
     partner.answered = message.answered || {};
     partner.revealed = message.revealed || {};
     if (profile.role === "host") profile.partnerName = partner.name;
+    saveOwn();
+  }
+  if (message.type === "custom-question") {
+    mergeCustomQuestions([message.question]);
     saveOwn();
   }
   if (message.type === "answer-status") {
@@ -316,27 +340,54 @@ function renderApp() {
 }
 
 function renderQuestions() {
+  const questions = allQuestions();
   const count = Object.values(own.answers).filter(Boolean).length;
-  app.innerHTML = `${header(`Hi, ${profile.name}`, "Your private answers")}<section class="hero-row"><p class="muted" style="margin:0">Saved as you. Your words stay here until reveal.</p><div class="progress-ring" style="--progress:${count / QUESTIONS.length * 360}deg"><span>${count}/${QUESTIONS.length}</span></div></section><div class="question-list">${QUESTIONS.map((question, index) => `<button class="question ${own.answers[index] ? "done" : ""}" data-question="${index}"><span class="question-number">${own.answers[index] ? "✓" : index + 1}</span><span class="question-title">${escapeHTML(question)}</span><span class="question-status">›</span></button>`).join("")}</div>${nav()}`;
-  document.querySelectorAll("[data-question]").forEach((button) => button.addEventListener("click", () => editAnswer(Number(button.dataset.question))));
+  app.innerHTML = `${header(`Hi, ${profile.name}`, "Your private answers")}<section class="hero-row"><p class="muted" style="margin:0">Saved as you. Your words stay here until reveal.</p><div class="progress-ring" style="--progress:${count / questions.length * 360}deg"><span>${count}/${questions.length}</span></div></section><button id="add-question" class="button secondary add-question">＋ Add your own question</button><div class="question-list">${questions.map((question, index) => `<button class="question ${own.answers[question.id] ? "done" : ""}" data-question="${question.id}"><span class="question-number">${own.answers[question.id] ? "✓" : index + 1}</span><span class="question-title">${escapeHTML(question.text)}${question.author ? `<small>Added by ${escapeHTML(question.author)}</small>` : ""}</span><span class="question-status">›</span></button>`).join("")}</div>${nav()}`;
+  document.querySelector("#add-question").addEventListener("click", addCustomQuestion);
+  document.querySelectorAll("[data-question]").forEach((button) => button.addEventListener("click", () => editAnswer(button.dataset.question)));
 }
 
-function editAnswer(index) {
+function addCustomQuestion() {
   const overlay = document.createElement("div");
   overlay.className = "sheet-backdrop";
-  overlay.innerHTML = `<section class="sheet"><div class="sheet-handle"></div><p class="eyebrow">${escapeHTML(profile.name)} · Question ${index + 1}</p><h2>${escapeHTML(QUESTIONS[index])}</h2><div class="field" style="margin-top:18px"><label for="answer">Your answer</label><textarea id="answer" maxlength="600" placeholder="Write what feels true…">${escapeHTML(own.answers[index] || "")}</textarea></div><div class="sheet-actions"><button class="button ghost" id="cancel">Cancel</button><button class="button primary" id="save">Save as ${escapeHTML(profile.name)}</button></div></section>`;
+  overlay.innerHTML = `<section class="sheet"><div class="sheet-handle"></div><p class="eyebrow">Ask something personal</p><h2>Add your own question</h2><div class="field" style="margin-top:18px"><label for="custom-question">Question</label><textarea id="custom-question" maxlength="180" placeholder="What would you love to ask each other?"></textarea></div><div class="sheet-actions"><button class="button ghost" id="cancel">Cancel</button><button class="button primary" id="add">Add for both</button></div></section>`;
+  document.body.appendChild(overlay);
+  const close = () => overlay.remove();
+  overlay.addEventListener("click", (event) => { if (event.target === overlay) close(); });
+  document.querySelector("#cancel").addEventListener("click", close);
+  document.querySelector("#add").addEventListener("click", () => {
+    const text = document.querySelector("#custom-question").value.trim();
+    if (!text) return toast("Write a question first");
+    const question = { id: `c_${randomToken(9)}`, text, author: profile.name };
+    customQuestions.push(question);
+    saveOwn();
+    send({ type: "custom-question", question });
+    close();
+    renderApp();
+    toast("Question added for both of you");
+  });
+  document.querySelector("#custom-question").focus();
+}
+
+function editAnswer(id) {
+  const question = allQuestions().find((item) => item.id === id);
+  if (!question) return;
+  const number = allQuestions().findIndex((item) => item.id === id) + 1;
+  const overlay = document.createElement("div");
+  overlay.className = "sheet-backdrop";
+  overlay.innerHTML = `<section class="sheet"><div class="sheet-handle"></div><p class="eyebrow">${escapeHTML(profile.name)} · Question ${number}</p><h2>${escapeHTML(question.text)}</h2><div class="field" style="margin-top:18px"><label for="answer">Your answer</label><textarea id="answer" maxlength="600" placeholder="Write what feels true…">${escapeHTML(own.answers[id] || "")}</textarea></div><div class="sheet-actions"><button class="button ghost" id="cancel">Cancel</button><button class="button primary" id="save">Save as ${escapeHTML(profile.name)}</button></div></section>`;
   document.body.appendChild(overlay);
   const close = () => overlay.remove();
   overlay.addEventListener("click", (event) => { if (event.target === overlay) close(); });
   document.querySelector("#cancel").addEventListener("click", close);
   document.querySelector("#save").addEventListener("click", () => {
     const value = document.querySelector("#answer").value.trim();
-    if (value) own.answers[index] = value;
-    else delete own.answers[index];
-    delete own.revealed[index];
-    delete partner.revealed[index];
+    if (value) own.answers[id] = value;
+    else delete own.answers[id];
+    delete own.revealed[id];
+    delete partner.revealed[id];
     saveOwn();
-    send({ type: "answer-status", question: index, answered: Boolean(value) });
+    send({ type: "answer-status", question: id, answered: Boolean(value) });
     close();
     renderApp();
     toast(`Saved as ${profile.name}`);
@@ -345,15 +396,16 @@ function editAnswer(index) {
 }
 
 function renderTogether() {
-  const matching = QUESTIONS.map((_, index) => index).filter((index) => own.answers[index] && partner.answered[index]);
+  const questions = allQuestions();
+  const matching = questions.filter((question) => own.answers[question.id] && partner.answered[question.id]);
   const partnerName = partner.name || profile.partnerName || profile.hostName || "Partner";
-  app.innerHTML = `${header("Reveal together", "Updates live")}<section class="card sync-card"><div class="sync-icon">${connectionState === "live" ? "✨" : "⏳"}</div><h2>${connectionState === "live" ? `${matching.length} ready` : "Waiting to reconnect"}</h2><p class="muted">When either of you reveals a question, it opens instantly on both screens.</p></section><div class="reveal-grid">${QUESTIONS.map((question, index) => {
-    const mineAnswered = Boolean(own.answers[index]);
-    const theirsAnswered = Boolean(partner.answered[index]);
-    const open = Boolean(own.revealed[index] && partner.revealed[index]);
-    return `<article class="reveal-card"><p class="reveal-question">${escapeHTML(question)}</p><div class="ready-row"><span>${mineAnswered ? "✓" : "○"} ${escapeHTML(profile.name)}</span><span>${theirsAnswered ? "✓" : "○"} ${escapeHTML(partnerName)}</span></div>${open ? `<div class="answers"><div class="answer"><div class="answer-name">${escapeHTML(profile.name)}</div><div class="answer-text">${escapeHTML(own.revealed[index])}</div></div><div class="answer partner"><div class="answer-name">${escapeHTML(partnerName)}</div><div class="answer-text">${escapeHTML(partner.revealed[index])}</div></div></div>` : `<button class="button ${mineAnswered && theirsAnswered ? "primary" : "ghost"}" data-reveal="${index}" ${connectionState === "live" && mineAnswered && theirsAnswered ? "" : "disabled"}>${mineAnswered && theirsAnswered ? "Reveal this answer" : "Waiting for both answers"}</button>`}</article>`;
+  app.innerHTML = `${header("Reveal together", "Updates live")}<section class="card sync-card"><div class="sync-icon">${connectionState === "live" ? "✨" : "⏳"}</div><h2>${connectionState === "live" ? `${matching.length} ready` : "Waiting to reconnect"}</h2><p class="muted">When either of you reveals a question, it opens instantly on both screens.</p></section><div class="reveal-grid">${questions.map((question) => {
+    const mineAnswered = Boolean(own.answers[question.id]);
+    const theirsAnswered = Boolean(partner.answered[question.id]);
+    const open = Boolean(own.revealed[question.id] && partner.revealed[question.id]);
+    return `<article class="reveal-card"><p class="reveal-question">${escapeHTML(question.text)}</p><div class="ready-row"><span>${mineAnswered ? "✓" : "○"} ${escapeHTML(profile.name)}</span><span>${theirsAnswered ? "✓" : "○"} ${escapeHTML(partnerName)}</span></div>${open ? `<div class="answers"><div class="answer"><div class="answer-name">${escapeHTML(profile.name)}</div><div class="answer-text">${escapeHTML(own.revealed[question.id])}</div></div><div class="answer partner"><div class="answer-name">${escapeHTML(partnerName)}</div><div class="answer-text">${escapeHTML(partner.revealed[question.id])}</div></div></div>` : `<button class="button ${mineAnswered && theirsAnswered ? "primary" : "ghost"}" data-reveal="${question.id}" ${connectionState === "live" && mineAnswered && theirsAnswered ? "" : "disabled"}>${mineAnswered && theirsAnswered ? "Reveal this answer" : "Waiting for both answers"}</button>`}</article>`;
   }).join("")}</div>${nav()}`;
-  document.querySelectorAll("[data-reveal]").forEach((button) => button.addEventListener("click", () => revealQuestion(Number(button.dataset.reveal))));
+  document.querySelectorAll("[data-reveal]").forEach((button) => button.addEventListener("click", () => revealQuestion(button.dataset.reveal)));
 }
 
 function revealQuestion(index) {
@@ -376,6 +428,7 @@ function renderInvite() {
     profile = null;
     own = { answers: {}, revealed: {} };
     partner = { name: "Partner", answered: {}, revealed: {} };
+    customQuestions = [];
     connectionState = "offline";
     currentTab = "answer";
     landing();
